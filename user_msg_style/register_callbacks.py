@@ -1,10 +1,17 @@
-"""Restyles the echo of YOUR OWN message. Configure with /set: user_msg_color (a Rich color, e.g. #c5fc7d or cyan), user_msg_style (attributes, e.g. bold italic), user_msg_prefix (text before your message, default "> " -- quote it to keep a trailing space). Each is read per render, so /set takes effect on your next message with no restart. Unset = unchanged Code Puppy behavior.
+"""Restyles the echo of YOUR OWN message -- color, attributes and prefix -- without touching the agent's output. Three keys, all set with /set and all re-read on every render, so a change applies to your NEXT message with no restart. Unset = stock Code Puppy behavior. ......... [1] /set user_msg_color=VALUE -- the foreground. Four notations: hex #c5fc7d | name cyan, bright_magenta, dark_sea_green, grey54, red | palette color(42) (0-255) | rgb(197,252,125). Also 'default' (your terminal's own foreground); case is ignored. NOT accepted here: a background like 'on red' -- that belongs in user_msg_style. ......... [2] /set user_msg_style=VALUE -- attributes, space-separated. All thirteen: bold, dim, italic, underline, blink, blink2, reverse, strike, underline2, frame, encircle, overline, conceal. Safe nearly everywhere: bold, dim, italic, underline, reverse, strike -- the rest are emitted correctly but many terminals ignore them. Combine freely: 'bold italic', 'dim underline'. Empty means no attributes, color only. Negate with not: 'not bold italic'. BACKGROUNDS live here via Rich's on-syntax: 'bold on #303030', 'on blue'. A foreground put here works too but LOSES to user_msg_color (both end up in one style string and Rich takes the last color). ......... [3] /set user_msg_prefix=VALUE -- the text before your message, default "> ". Any text: "| ", "-> ", "you: ", or "" for none. QUOTE IT -- puppy.cfg strips whitespace, so an unquoted "> " loses its trailing space and your text sticks to the marker. The leading newline is layout and is not configurable. ......... Bad values never break anything: they fall back (style to bold, color to the prompt color, i.e. what the core would show) and warn ONCE, never per message. Full reference incl. worked examples: README.md next to this file.
 
-The first paragraph above is deliberately ONE long line: the /plugins TUI
-shows a plugin's description by taking the first paragraph of this module
-docstring (``plugin_list/plugin_meta.py:38-41``) and collapsing its
-newlines. It reads NO README -- so anything a user should discover from
-the TUI has to live in that paragraph, and a blank line ends it.
+The first paragraph above is deliberately ONE long line, and it is long on
+purpose: the /plugins TUI is the ONLY place a user discovers this plugin's
+settings, and the description is the only field we can fill. It reads no
+README, and config keys are not one of its "Contributes" categories.
+
+Format constraints, measured (``plugin_list/plugin_meta.py:38-41``):
+the TUI takes the FIRST paragraph and collapses newlines into spaces
+(``" ".join(line.strip() for line in first_para.splitlines())``), so a
+blank line TRUNCATES everything after it and manual line breaks are lost.
+Lists, tables and paragraphs are therefore impossible -- the "........."
+runs are the only available visual separator, and the pane wraps the rest
+itself (``plugins_menu_render.py:284-287``).
 
 Restyles the echo of the USER'S OWN message -- color, attributes, prefix --
 via three ``puppy.cfg`` keys, with no change to the Code Puppy core.
