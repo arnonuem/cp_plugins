@@ -5,7 +5,7 @@ kept in one repo and deployed selectively into `~/.code_puppy/plugins/`.
 
 ## Plugins
 
-| | Plugin | What it does |
+| Plugin | What it does |
 |--------|--------------|
 | [`user_msg_style`](user_msg_style/) | Restyles the echo of your own message -- color, attributes, prefix -- via `/set` |
 | [`wmux`](wmux/) | Reports agent state (working / blocked / idle) to the [wmux](https://github.com/amirlehmam/wmux) multiplexer, so a session parked on you is visible at a glance instead of looking identical to a finished one. Windows named pipe; inert outside a wmux pane |
