@@ -5,17 +5,18 @@ kept in one repo and deployed selectively into `~/.code_puppy/plugins/`.
 
 ## Plugins
 
-| Plugin | What it does |
+| | Plugin | What it does |
 |--------|--------------|
 | [`user_msg_style`](user_msg_style/) | Restyles the echo of your own message -- color, attributes, prefix -- via `/set` |
+| [`wmux`](wmux/) | Reports agent state (working / blocked / idle) to the [wmux](https://github.com/amirlehmam/wmux) multiplexer, so a session parked on you is visible at a glance instead of looking identical to a finished one. Windows named pipe; inert outside a wmux pane |
 
 ## Deploy
 
 ```powershell
-.\deploy.ps1 user_msg_style          # one plugin
-.\deploy.ps1 user_msg_style foo bar  # several
-.\deploy.ps1 -All                    # every plugin in the repo
-.\deploy.ps1 user_msg_style -WhatIf  # dry run, touches nothing
+.\deploy.ps1 wmux                     # one plugin
+.\deploy.ps1 wmux,user_msg_style      # several -- comma-separated, not spaces
+.\deploy.ps1 -All                     # every plugin in the repo
+.\deploy.ps1 wmux -WhatIf             # dry run, touches nothing
 ```
 
 Target is `$env:USERPROFILE\.code_puppy\plugins\<name>\`.
