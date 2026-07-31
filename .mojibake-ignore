@@ -1,0 +1,28 @@
+# Paths excluded from the mojibake scan.
+# Tree-covering globs: the tool matches fnmatch(rel_posix, pattern), so a bare
+# directory name would NOT cover its contents.
+
+# Process artifacts (spec-sets, follow-up ledger, docs) - not shipped code.
+specs/*
+specs/**
+followups/*
+followups/**
+docs/*
+docs/**
+
+# Caches and build artifacts.
+.pytest_cache/*
+.pytest_cache/**
+__pycache__/*
+__pycache__/**
+*.pyc
+
+# Git internals.
+.git/*
+.git/**
+
+# FALSE POSITIVE, verified 2026-07-31: this test deliberately contains
+# fullwidth digits ('discord:４２') as its SUBJECT -- the comment on the same
+# line says "fullwidth digits". Normalising them to ASCII would make the test
+# assert that "discord:42" behaves like "discord:42", i.e. silently gut it.
+cp_discord/tests/test_review_round_8.py
