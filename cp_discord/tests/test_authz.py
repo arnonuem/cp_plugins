@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from code_puppy.plugins.cp_discord import authz, bindings
+from cp_discord import authz, bindings
 
 ALICE = "alice"
 BOB = "bob"
