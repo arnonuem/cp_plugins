@@ -513,6 +513,72 @@ def test_a_second_click_is_not_delivered_twice(broker, gateway, session, channel
 
 
 # --------------------------------------------------------------------------- #
+# §3.2b — WHY the gateway gets a factory and not a view
+# --------------------------------------------------------------------------- #
+
+
+def test_building_a_view_off_the_loop_raises():
+    """The measured fact the factory exists for, pinned so it cannot rot.
+
+    ``discord/ui/core.py:79`` calls ``asyncio.get_running_loop()`` inside
+    ``View.__init__`` and line 83 makes a future on it.  A gate frame arrives
+    on the broker's TCP handler thread, which has NO loop -- so a view built
+    where the frame is parsed dies before it can reach Discord.
+
+    Should py-cord ever make that lazy, this test fails and the factory
+    indirection can be reconsidered on evidence rather than on a comment.
+    """
+    import discord
+
+    failure: dict = {}
+
+    def on_a_thread_without_a_loop() -> None:
+        try:
+            discord.ui.View(timeout=None)
+        except BaseException as exc:  # noqa: BLE001 - the type IS the assertion
+            failure["exc"] = exc
+
+    thread = threading.Thread(target=on_a_thread_without_a_loop)
+    thread.start()
+    thread.join()
+
+    assert isinstance(failure.get("exc"), RuntimeError)
+    assert "no running event loop" in str(failure["exc"])
+
+
+def test_the_view_is_built_on_the_gateway_loop_not_the_caller_thread(
+    broker, gateway, session, channel
+):
+    """The factory is INVOKED where Discord's loop runs, not where it is made.
+
+    Without this the previous test only proves a py-cord property; this one
+    proves our plumbing actually exploits it.
+    """
+    instance = registered(session, gateway)
+
+    built_on: list = []
+    original = approvals_ui.build_gate_view
+
+    def recording(gate_id, report):
+        # The loop AT BUILD TIME -- asserting merely "a different thread" would
+        # still pass if the view were built on the broker's handler thread,
+        # which has no loop at all and is exactly the crash we are preventing.
+        built_on.append(asyncio.get_running_loop())
+        return original(gate_id, report)
+
+    approvals_ui.build_gate_view = recording
+    try:
+        assert instance.submit_gate("g-loop", "Shell Command", "`ls`") is True
+        gateway.wait_idle()
+    finally:
+        approvals_ui.build_gate_view = original
+
+    assert built_on, "the view factory was never invoked"
+    assert built_on == [gateway._loop]
+    assert posted_gate(channel).view is not None
+
+
+# --------------------------------------------------------------------------- #
 # AC-47 — the files W4 touched stay under 600 lines
 # --------------------------------------------------------------------------- #
 
