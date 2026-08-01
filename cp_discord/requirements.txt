@@ -1,0 +1,12 @@
+# Third-party packages this plugin needs at runtime.
+#
+# deploy.ps1 reads this file and offers to install the entries into the
+# environment Code Puppy actually runs from. Code Puppy's user-tier plugin
+# loader has no dependency mechanism of its own -- it imports
+# register_callbacks.py by file location and nothing else -- so without this
+# the plugin deploys cleanly and then refuses to start.
+#
+# py-cord, NOT discord.py: the two ship the same top-level `discord` module
+# and cannot coexist. register_callbacks.py checks for ApplicationContext to
+# tell them apart.
+py-cord>=2.8.1,<3
