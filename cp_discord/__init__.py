@@ -1,6 +1,10 @@
-"""Code Puppy as a Discord bot — one independent agent run per channel.
+"""Discord terminal bridge — running terminal sessions announce themselves.
 
-The plugin is split by layer: ``concurrency`` (session attribution + per-session
-approval locks), ``gateway``/``register_callbacks`` (transport), ``bindings``/
-``authz`` (identity), ``approvals`` (gates) and ``output`` (routing).
+The terminal stays the primary interface; Discord is a side channel that lets
+you watch a session from your phone and answer its approval gates.
+
+Split by layer: ``register_callbacks`` (lifecycle + configuration),
+``bindings``/``authz`` (identity), ``approvals``/``approvals_ui`` (gates),
+``chunking``/``rendering`` (message shaping) and ``constants``/``session_ids``
+(the values and formats every layer has to agree on).
 """

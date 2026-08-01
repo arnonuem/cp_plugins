@@ -1,12 +1,20 @@
 # Third-party packages this plugin needs at runtime.
 #
-# deploy.ps1 reads this file and offers to install the entries into the
-# environment Code Puppy actually runs from. Code Puppy's user-tier plugin
-# loader has no dependency mechanism of its own -- it imports
-# register_callbacks.py by file location and nothing else -- so without this
-# the plugin deploys cleanly and then refuses to start.
+# Install them into the environment Code Puppy runs from BEFORE deploying:
+#
+#     uv sync --extra discord
+#
+# This file is documentation, not automation. deploy.ps1 copies top-level
+# *.py and README.md only (:234-235) and never reads this file, and Code
+# Puppy's user-tier plugin loader has no dependency mechanism of its own --
+# it imports register_callbacks.py by file location and nothing else. An
+# undeclared dependency therefore deploys cleanly and then leaves the bridge
+# inactive, with the reason printed once at startup.
+#
+# Missing it is not fatal: the bridge stands down and the terminal session
+# runs normally (INV-C1).
 #
 # py-cord, NOT discord.py: the two ship the same top-level `discord` module
-# and cannot coexist. register_callbacks.py checks for ApplicationContext to
-# tell them apart.
+# and cannot coexist. register_callbacks.load_pycord() checks for
+# ApplicationContext to tell them apart, because plain importability cannot.
 py-cord>=2.8.1,<3
