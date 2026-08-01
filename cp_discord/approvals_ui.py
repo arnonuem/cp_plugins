@@ -1,13 +1,29 @@
-"""The Discord half of the L4 approval bridge: widgets, text, and clicks.
+"""The Discord half of the approval bridge: widgets, text, and clicks.
 
-:mod:`.approvals` decides *who answers for an operation* and *whether it may
-proceed*.  This module decides *what the human sees* and *what a button press
-does* -- the presentation seam, split out because the policy half had grown
-past the project's 600-line cap with two unrelated concerns inside it.
+:mod:`.approvals` decides *whether an operation may proceed*.  This module
+decides *what the human sees* and *what a button press means* -- the
+presentation seam, kept apart because the policy half is where the
+concurrency lives and neither concern should have to be read to understand
+the other.
 
-Everything here runs ON the gateway loop.  Nothing here reads session context:
-a gate arrives already attributed, which is what keeps attribution in exactly
-one place.
+**What changed in the rebuild** (SPEC §2 import matrix, W4's UPDATE dossier).
+This module used to reach into ``gateway`` for the Discord client
+(``get_client()``, ``allowed_mentions()``) and into ``authz`` for
+``authorize_resolution``.  ``gateway.py`` is deleted, and INV-C25 rules
+``authorize_resolution`` out: it demands a session principal
+(``authz.py:228-230``) that a session started at a TERMINAL never has, so
+every gate would have been refused.
+
+So both went, and what stayed is the part that was always worth keeping: the
+button/view structure and the interaction handling.  Two consequences shape
+the rest:
+
+* **the connection is not ours any more.**  The Discord connection lives in
+  the BROKER (C1), possibly in another process entirely.  This module never
+  looks a channel up; it builds a view and hands it over.
+* **authorization moved to the SESSION** (§3.2a).  A click travels back over
+  the return channel, and the APPROVER check happens where the gate lives.
+  The callback here therefore reports a decision -- it does not make one.
 
 Two rendering rules are security properties, not cosmetics:
 
@@ -17,59 +33,61 @@ Two rendering rules are security properties, not cosmetics:
   the requester can forge is not an approval UI;
 * **mentions are suppressed** (:func:`allowed_mentions`).  Gate text quotes
   attacker-influenced content verbatim; an ``@everyone`` inside it would ping
-  the whole server.  The client sets a default too, but that is process-wide
-  state another frontend can change, so the message carries its own.
+  the whole server.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
-from . import authz, gateway
+from . import authz
 
 logger = logging.getLogger(__name__)
 
 APPROVE_LABEL = "Approve"
 DENY_LABEL = "Deny"
 
+#: What a click MEANS on the wire (§3.2a's ``decision`` field).  Named here
+#: because the buttons are what produce it; :mod:`.approvals` imports these
+#: rather than comparing against a second pair of literals.
+DECISION_APPROVE = "approve"
+DECISION_DENY = "deny"
+
+#: Kept identical to L3's, so a gate and its widget die at the same moment.
+#: Imported rather than repeated: ``authz.py:42-49`` carries the reason the
+#: number is 120 (Discord's interaction token), and a copy here would lose it.
+GATE_TIMEOUT_SECONDS = authz.GATE_TIMEOUT_SECONDS
+
 #: Longest preview inlined into a gate.  Discord caps a body at 2000
 #: characters, so one huge diff must not push the buttons off the message.
 PREVIEW_LIMIT = 1200
 
+#: Replies to a click that resolves nothing.  Both are ephemeral: they answer
+#: the person who clicked, not the channel.
+ALREADY_DECIDED = "This request has already been decided."
+NOT_DELIVERED = "The session did not take this decision — please try again."
 
-class ApprovalUIError(RuntimeError):
-    """Raised when a gate cannot be shown at all (never a silent bypass)."""
-
-
-@dataclass
-class PendingGate:
-    """One open gate: its authz record, the waiter, and the posted message."""
-
-    gate: authz.Gate
-    future: "asyncio.Future[bool]"
-    message: Any = None
-    view: Any = None
+#: What a click reports back.  ``(decision, discord_user_id) -> reply or None``;
+#: ``None`` means "taken, nothing to say".
+ClickReporter = Callable[[str, str], Awaitable[Optional[str]]]
 
 
-#: Gate id -> the gate awaiting a click.  Owned here because the click handler
-#: is the only thing that resolves one.
-_PENDING: Dict[str, PendingGate] = {}
+def allowed_mentions() -> Any:
+    """An ``AllowedMentions`` that pings nobody.  Used on EVERY gate send.
 
+    py-cord leaves ``Client.allowed_mentions`` at ``None``, which means
+    Discord's own permissive default applies.  A gate quotes the command
+    verbatim, so an ``@everyone`` sitting in a repository file would otherwise
+    notify the whole server the moment it reaches a gate message.
 
-def pending_gates() -> Dict[str, PendingGate]:
-    """The gates currently awaiting a click.  Read-only view for tests/L5."""
-    return dict(_PENDING)
+    Lives here rather than on the gateway because the message that needs it is
+    built here, and a per-message value cannot be switched off by process-wide
+    state somebody else owns.
+    """
+    import discord
 
-
-def reset_state() -> None:
-    """Cancel and forget every open gate.  Used at teardown and by tests."""
-    for pending in list(_PENDING.values()):
-        if not pending.future.done():
-            pending.future.cancel()
-    _PENDING.clear()
+    return discord.AllowedMentions.none()
 
 
 # --------------------------------------------------------------------------- #
@@ -101,8 +119,19 @@ def inline_code(text: str) -> str:
     return f"{fence} {flattened} {fence}"
 
 
-def gate_text(title: str, message: str, preview: Optional[str]) -> str:
-    """The full gate body: what it is, what it touches, how long it lives."""
+def gate_text(
+    title: str,
+    message: str,
+    preview: Optional[str] = None,
+    *,
+    remote_resolvable: bool = True,
+) -> str:
+    """The full gate body: what it is, what it touches, how it can be answered.
+
+    The closing line differs by design.  A gate with buttons says how long it
+    lives; a gate WITHOUT them says so plainly (INV-C23) instead of inviting
+    somebody to wait for an answer that can only be given at the machine.
+    """
     lines = [f"**{title}**", message or ""]
     if preview:
         # Fenced so a diff stays legible; truncated so one huge edit cannot
@@ -113,92 +142,79 @@ def gate_text(title: str, message: str, preview: Optional[str]) -> str:
             else preview[:PREVIEW_LIMIT] + "\n…"
         )
         lines.append(f"```\n{body}\n```")
-    lines.append(
-        f"Approve or deny below — this request expires in "
-        f"{authz.GATE_TIMEOUT_SECONDS:.0f} s."
-    )
+    if remote_resolvable:
+        lines.append(
+            f"Approve or deny below — this request expires in "
+            f"{GATE_TIMEOUT_SECONDS:.0f} s."
+        )
+    else:
+        from .reporter import LOCAL_ONLY_MARKER
+
+        lines.append(f"— {LOCAL_ONLY_MARKER}")
     return "\n".join(part for part in lines if part)
 
 
-def build_view(pending: PendingGate) -> Any:
-    """Two buttons wired to *pending*, built without a live client.
+# --------------------------------------------------------------------------- #
+# The widget
+# --------------------------------------------------------------------------- #
+
+
+def build_gate_view(gate_id: str, report: ClickReporter) -> Any:
+    """Two buttons that REPORT a decision for *gate_id*.
+
+    Must be called with a running event loop: py-cord's ``View`` grabs one in
+    its constructor (``discord/ui/core.py:79``, measured).  That single fact is
+    why the broker hands a view FACTORY to the gateway instead of a view --
+    only the gateway knows which loop Discord is on.
 
     The decorator form cannot be used: every gate needs its own callbacks, so
     the items are constructed and their ``callback`` assigned per gate.
+
+    *report* answers what happened, and the answer goes to the CLICKER only
+    (ephemeral): whether a click was authorized is not the channel's business.
     """
     import discord
 
-    view = discord.ui.View(timeout=authz.GATE_TIMEOUT_SECONDS, store=False)
-    gate_id = pending.gate.gate_id
-    for label, style, allowed in (
-        (APPROVE_LABEL, discord.ButtonStyle.success, True),
-        (DENY_LABEL, discord.ButtonStyle.danger, False),
+    view = discord.ui.View(timeout=GATE_TIMEOUT_SECONDS, store=False)
+    for label, style, decision in (
+        (APPROVE_LABEL, discord.ButtonStyle.success, DECISION_APPROVE),
+        (DENY_LABEL, discord.ButtonStyle.danger, DECISION_DENY),
     ):
         button = discord.ui.Button(
-            label=label,
-            style=style,
-            custom_id=f"cp-gate:{gate_id}:{'allow' if allowed else 'deny'}",
+            label=label, style=style, custom_id=f"cp-gate:{gate_id}:{decision}"
         )
-
-        async def _callback(interaction: Any, _allowed: bool = allowed) -> None:
-            await on_click(gate_id, _allowed, interaction)
-
-        button.callback = _callback
+        button.callback = _make_callback(decision, report)
         view.add_item(button)
     return view
 
 
-# --------------------------------------------------------------------------- #
-# Posting and resolving
-# --------------------------------------------------------------------------- #
+def _make_callback(decision: str, report: ClickReporter):
+    async def callback(interaction: Any) -> None:
+        await on_click(decision, report, interaction)
+
+    return callback
 
 
-async def _channel_for(channel_id: int) -> Any:
-    """The channel object, from cache or fetched.  Raises if unreachable."""
-    client = gateway.get_client()
-    if client is None:
-        raise ApprovalUIError("the Discord gateway is not connected")
-    channel = client.get_channel(channel_id)
-    if channel is None:
-        channel = await client.fetch_channel(channel_id)
-    if channel is None:
-        raise ApprovalUIError(f"channel {channel_id} is not reachable")
-    return channel
+async def on_click(decision: str, report: ClickReporter, interaction: Any) -> None:
+    """Handle one button press.  The ORDER here is binding.
 
-
-async def post_gate(
-    channel_id: int,
-    gate: authz.Gate,
-    title: str,
-    message: str,
-    preview: Optional[str],
-) -> PendingGate:
-    """Post *gate* into its channel and register it as awaiting a click.
-
-    Raises on any Discord failure; the caller turns that into a refusal
-    (INV-3) after undoing its own bookkeeping.
+    ``defer()`` first — Discord drops an interaction that is not acknowledged
+    within 3 s — then report, and only then answer.  Missing the deadline
+    costs us the reply, never the decision, so the defer failure is swallowed.
     """
-    loop = asyncio.get_running_loop()
-    pending = PendingGate(gate=gate, future=loop.create_future())
-    _PENDING[gate.gate_id] = pending
     try:
-        pending.view = build_view(pending)
-        channel = await _channel_for(channel_id)
-        pending.message = await channel.send(
-            gate_text(title, message, preview),
-            view=pending.view,
-            # A gate quotes the command verbatim; it must ping nobody.
-            allowed_mentions=gateway.allowed_mentions(),
-        )
+        await interaction.response.defer()
     except Exception:
-        _PENDING.pop(gate.gate_id, None)
-        raise
-    return pending
+        logger.debug("cp_discord: defer() failed on a gate click", exc_info=True)
 
-
-def forget(gate_id: str) -> None:
-    """Drop a resolved gate from the pending registry.  Idempotent."""
-    _PENDING.pop(gate_id, None)
+    user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+    try:
+        reply = await report(decision, user_id)
+    except Exception:
+        logger.debug("cp_discord: reporting a gate click failed", exc_info=True)
+        reply = NOT_DELIVERED
+    if reply:
+        await _reply(interaction, reply)
 
 
 async def _reply(interaction: Any, text: str) -> None:
@@ -206,58 +222,37 @@ async def _reply(interaction: Any, text: str) -> None:
     try:
         await interaction.response.send_message(text, ephemeral=True)
     except Exception:
-        logger.debug("Discord: could not send an ephemeral reply", exc_info=True)
+        logger.debug("cp_discord: could not send an ephemeral reply", exc_info=True)
 
 
-async def on_click(gate_id: str, allowed: bool, interaction: Any) -> None:
-    """Handle one button press (SPEC-L4 §4.3a, order is binding).
+def disable(view: Any) -> None:
+    """Take a resolved gate's buttons out of service.  Never raises.
 
-    ``defer()`` first — Discord drops an interaction that is not acknowledged
-    within 3 s — then authorize, and only then resolve.  Every refusal leaves
-    the gate OPEN: an outsider's click must not consume somebody else's
-    pending approval.
+    A live button under a decided gate is worse than no button: it invites a
+    click that can only be answered with \"too late\".
     """
-    try:
-        await interaction.response.defer()
-    except Exception:
-        # Missing the 3 s deadline costs us the reply, not the decision.
-        logger.debug("Discord: defer() failed on a gate click", exc_info=True)
-
-    pending = _PENDING.get(gate_id)
-    if pending is None or pending.future.done():
-        # Double-click, network retry, or a gate that already expired.  Both
-        # must be idempotent: no second resolution, no second edit.
-        await _reply(interaction, "This request has already been decided.")
+    if view is None:
         return
-
-    external_id = str(getattr(interaction.user, "id", ""))
-    decision = authz.authorize_resolution(gate_id, gateway.SESSION_PREFIX, external_id)
-    if not decision.allowed:
-        reason = decision.reason.value if decision.reason else "not_allowed"
-        await _reply(interaction, f"You may not answer this request ({reason}).")
-        return
-
-    authz.close_gate(gate_id)
-    if not pending.future.done():
-        pending.future.set_result(allowed)
-
-    verdict = "APPROVED" if allowed else "DENIED"
-    await finish_message(
-        pending, f"**{verdict}** by {decision.principal} — {pending.gate.title}"
-    )
-
-
-async def finish_message(pending: PendingGate, text: str) -> None:
-    """Disable the buttons and write the outcome back.
-
-    Wrapped: a Discord outage while closing must never turn a decision that was
-    already made into a hung gate.
-    """
     try:
-        if pending.view is not None:
-            pending.view.disable_all_items()
-            pending.view.stop()
-        if pending.message is not None:
-            await pending.message.edit(content=text, view=pending.view)
+        view.disable_all_items()
+        view.stop()
     except Exception:
-        logger.warning("Discord: could not finalise a gate message", exc_info=True)
+        logger.debug("cp_discord: could not disable a gate view", exc_info=True)
+
+
+__all__: Sequence[str] = (
+    "ALREADY_DECIDED",
+    "APPROVE_LABEL",
+    "DECISION_APPROVE",
+    "DECISION_DENY",
+    "DENY_LABEL",
+    "GATE_TIMEOUT_SECONDS",
+    "NOT_DELIVERED",
+    "PREVIEW_LIMIT",
+    "allowed_mentions",
+    "build_gate_view",
+    "disable",
+    "gate_text",
+    "inline_code",
+    "on_click",
+)

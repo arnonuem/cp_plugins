@@ -1,78 +1,75 @@
-"""L4 approval bridge — gates are answered in Discord, never on stdin.
+"""C4 — the approval switch: both ways at once, exactly one winner (SPEC §5).
 
-**Two independent paths are required, and missing the second one is the most
-dangerous single defect in this plugin.**
+**There is no switch any more, and that is the whole design.**  The previous
+version routed EITHER to Discord OR to the terminal, decided by a ContextVar
+that is only set when the turn CAME from Discord.  Requirement 8 is the
+opposite case -- start at the PC, leave the house, answer on the phone -- so
+every approval of such a run would have landed at a terminal nobody was
+sitting at.  Hence: every approval goes BOTH ways, and the first answer wins.
 
-``set_approval_backend`` covers file operations.  Shell runs straight past it:
-the core only prompts when ``not running_as_subagent and sys.stdin.isatty()``
-(``tools/command_runner.py:1236,1241``).  Headless both are False, so the prompt
-is skipped and the command *executes*.  A bot that only sets the backend secures
-files and waves ``rm -rf`` through.  Hence the ``run_shell_command`` hook — and
-note it has TWO reasons to exist, not one: even *with* a TTY a sub-agent never
-gets a core approval, so the hook is the only protection sub-agent shell has.
+Four things carry that, and each exists because its absence is a hang or a
+silent denial:
 
-``yolo_mode`` does not apply over Discord (L3/R4).  Nothing here reads it; the
-shell path enforces that by simply never asking, and the file path needs its own
-callback because the core short-circuits *before* the backend
-(``plugins/file_permission_handler/register_callbacks.py:466``).  That callback
-abstains while the bypass is off, or every file operation would be gated twice
-(``callbacks.py`` runs every registered callback).
+**The slot is never emptied** (INV-C5).  The core's backend check sits outside
+every plugin lock (``common.py:1442-1443``), so a request arriving during a
+swap would sail straight past us.  No lock can close that hole -- so there is
+no swap.
 
-**Sub-agents do not inherit the Discord session id.**  Measured, contradicting
-SPEC-L3/R5: ``tools/subagent_invocation.py:310`` calls ``set_session_context``
-with a freshly generated child id, which L1 patch A2-set mirrors into the
-Discord ContextVar — so inside a sub-agent both the shell hook and the approval
-backend see ``qa-expert-session-a3f2b1``, not ``discord:<channel_id>``.  Left
-alone that is fail-closed (every sub-agent gate refused, AC-40 unreachable), so
-:func:`on_pre_tool_call` records ``child sid -> triggering discord sid`` while
-it still can, and :func:`_resolve_session` reads it back.  A plain dict, not a
-ContextVar: the backend runs in an executor thread, which inherits none (INV-6).
+**We never call the core approval** (INV-C6).  It would land on the same check
+and recurse.  The terminal branch is driven directly, in
+:mod:`.approvals_prompt`.
 
-**That map is shared, so it is the LAST resort, never the first.**  The child
-id is model-chosen (``invoke_agent``'s ``session_id`` parameter, taken verbatim
-for a session that already has history) and the generated form is a six-hex-
-character hash, so two channels can end up using one id.  Whoever asks the map
-first therefore risks posting this channel's gate into the channel that stamped
-that id last — against that channel's principal.  :func:`_current_session`
-prefers the context-local ``_ORIGIN_SID``, which is right per run by
-construction; and where only the map exists (the executor thread), an id two
-live runs both claimed resolves to ``None`` and the gate is refused (INV-3)
-rather than silently routed to one of them.
+**The mark is three-valued, not a bool** (INV-C20, §5.2a).  ``exit()`` on an
+Application that is not running yet EVAPORATES -- ``get_app()`` hands back a
+``DummyApplication`` -- and behind it a prompt would then wait for an already
+resolved gate, with no timeout at all (INV-C10).  The mark, the slot and the
+CAS live in :mod:`.approvals_state`, and everything is given back on EVERY
+exit (§5.2a step 5): without that the terminal branch is dead after the FIRST
+approval of a run, and a run makes many.
+
+The timeout is not an exit: it ends the DISCORD branch only (INV-C10).  The
+terminal prompt has no timeout, exactly as without this plugin.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
 import logging
 import threading
-from collections import OrderedDict
-from typing import Any, Dict, Optional, Tuple
+import uuid
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from code_puppy.callbacks import register_callback, unregister_callback
 
-from . import approvals_ui, authz, concurrency, gateway
-from .session_ids import channel_id_of, is_session_id
+from . import approvals_prompt, approvals_ui, bindings, constants
+from .approvals_state import (
+    MARK_EMPTY,
+    MARK_LIVE,
+    MARK_PENDING,
+    WINNER_REMOTE,
+    WINNER_TERMINAL,
+    Gate,
+    SwitchState,
+)
+from .approvals_ui import DECISION_APPROVE, GATE_TIMEOUT_SECONDS
+from .bindings import Role
 
 logger = logging.getLogger(__name__)
 
-GATE_TIMEOUT_SECONDS = authz.GATE_TIMEOUT_SECONDS
-"""Kept identical to L3's, so a gate and its button die at the same moment."""
+#: Marks OUR backend so a double load is loud rather than silently
+#: overwriting.  Local on purpose: ``concurrency.py`` (its previous home) is
+#: deleted, this module is the only reader, and putting it in ``constants.py``
+#: would hang C4 off another layer for one string.
+SENTINEL = "_cp_discord"
 
-_RESULT_GRACE_SECONDS = 30.0
-"""Slack for the executor-side wait, so the INNER timeout is what fires.
+#: What the channel is told when the other side answered first (AC-37/39).
+DECIDED_IN_TERMINAL = "im Terminal entschieden"
+DECIDED_IN_DISCORD = "in Discord entschieden"
+GATE_EXPIRED = "abgelaufen - nur noch am PC beantwortbar"
 
-The blocking ``future.result()`` must outlive the gate itself; otherwise the
-outer wait wins the race and the channel is left with a live gate nobody is
-listening to any more.
-"""
-
-#: Re-exported: the labels are part of L4's public surface (tests click them).
-APPROVE_LABEL = approvals_ui.APPROVE_LABEL
-DENY_LABEL = approvals_ui.DENY_LABEL
-
-_MAX_TRACKED_SUBAGENTS = 512
-"""Bound on the child-session map — sub-agent ids are never reused."""
+#: How often the waiting backend re-checks whether both branches are done.
+#: Short, because it also bounds how long a branch ABORT (as opposed to an
+#: answer) takes to be noticed -- an answer wakes it immediately.
+_WAIT_TICK = 0.05
 
 _INTERACTIVE_TOOLS = frozenset({"ask_user_question"})
 _INTERACTIVE_BLOCK: Dict[str, Any] = {
@@ -80,38 +77,14 @@ _INTERACTIVE_BLOCK: Dict[str, Any] = {
     "error_message": (
         "[BLOCKED] Interactive pickers cannot be shown over Discord. Ask the "
         "user your question directly in your normal text response and wait for "
-        "their reply in the channel — do not call this tool."
+        "their reply -- do not call this tool."
     ),
 }
-"""Steering the model beats letting it read a dead stdin (SPEC-L4 §4.4)."""
+"""INV-C16/AC-61: the phone would see BLOCKED with no way to answer.
 
-_UNGATEABLE_TOOLS = frozenset({"universal_constructor"})
-_UNGATEABLE_BLOCK: Dict[str, Any] = {
-    "blocked": True,
-    "error_message": (
-        "[BLOCKED] universal_constructor is disabled over Discord. It writes "
-        "model-authored Python to disk and executes it without passing either "
-        "approval path, so nobody in the channel could review it. Use the "
-        "ordinary file and shell tools instead — those raise a gate the user "
-        "can actually answer."
-    ),
-}
-"""Blocked, not gated — and every action, not just the writing ones.
-
-``universal_constructor`` writes model-chosen Python with ``Path.write_text``
-(``tools/universal_constructor.py:544,681``) and runs it through
-``executor.submit`` (``:355``).  Neither touches ``on_file_permission`` (grep:
-no hit in that file) nor the shell runner, so BOTH seams this module installs
-are bypassed.  It is reachable from a plain Discord message: the default agent
-has ``invoke_agent`` (``agents/agent_code_puppy.py:27``), ``helios`` has the
-tool (``agents/agent_helios.py:26``) and it is on by default
-(``tools/__init__.py:355``).
-
-Why blocked rather than gated: a gate whose payload is arbitrary Python is not
-reviewable in a chat message, and "approve" would mean approving something the
-reader cannot evaluate.  Why every action: the discriminator is a model-chosen
-``action`` string, so allow-listing ``list``/``info`` would put the model in
-charge of whether code execution is gated.
+Only while a broker is reachable.  Without one the session is a plain terminal
+session and must behave exactly as it would without this plugin (INV-C19) --
+blocking a picker there would take away a tool that works perfectly well.
 """
 
 
@@ -119,482 +92,508 @@ class ApprovalError(RuntimeError):
     """Raised when the bridge cannot be installed (never a silent bypass)."""
 
 
-# --------------------------------------------------------------------------- #
-# Module state
-# --------------------------------------------------------------------------- #
+#: Everything two threads share (INV-C29).  One object, one lock -- see
+#: :mod:`.approvals_state` for why they are decided together.
+_state = SwitchState()
 
-#: The Discord session that triggered the work running right now.  Stamped on
-#: the loop while the id is still visible, so it survives into the tasks a
-#: sub-agent invocation spawns (context copy).
-_ORIGIN_SID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "cp_discord_origin_sid", default=None
-)
-
-#: child session id -> the Discord sessions that claimed it.  A SET, not a
-#: single id: the child id is model-chosen (``invoke_agent``'s ``session_id``
-#: parameter, taken verbatim for an existing session —
-#: ``subagent_invocation.py:290``) and the auto-generated form is a 6-character
-#: sha1 slice, so two channels really can claim one id.  With more than one
-#: claimant the map cannot say whose operation this is, and last-writer-wins
-#: would only choose a different victim — so it resolves to ``None`` and the
-#: caller refuses (INV-3).  See the module docstring for why it is a dict.
-_SUBAGENT_ORIGIN: "OrderedDict[str, set]" = OrderedDict()
-_ORIGIN_GUARD = threading.Lock()
-"""The map is written on the gateway loop and read from an executor thread."""
-
-_INSTALLED = False
-_PREVIOUS_BACKEND: Any = None
+_reporter: Any = None
+_installed = False
+_previous_backend: Any = None
 
 
-def pending_gates() -> Dict[str, approvals_ui.PendingGate]:
-    """The gates currently awaiting a click.  Read-only view for tests/L5."""
-    return approvals_ui.pending_gates()
+# -- observation (tests and neighbours) ------------------------------------
 
 
-def subagent_origins() -> Dict[str, set]:
-    """Child session id -> claiming Discord sessions.  Read-only copy."""
-    with _ORIGIN_GUARD:
-        return {child: set(origins) for child, origins in _SUBAGENT_ORIGIN.items()}
+def open_gates() -> List[str]:
+    return _state.open_ids()
+
+
+def prompt_mark() -> str:
+    return _state.mark
+
+
+def prompt_slot() -> Optional[str]:
+    return _state.slot
+
+
+def live_application() -> Any:
+    return _state.live_app
+
+
+def flag_generation() -> int:
+    return _state.flag_generation
+
+
+def state_lock_held_by_me() -> bool:
+    return _state.held_here()
+
+
+def set_reporter(reporter: Any) -> None:
+    """Point gate reporting at C3 (INV-C24), or at nothing."""
+    global _reporter
+    _reporter = reporter
 
 
 def reset_state() -> None:
     """Drop every in-memory trace.  Used at teardown and between tests."""
-    approvals_ui.reset_state()
-    with _ORIGIN_GUARD:
-        _SUBAGENT_ORIGIN.clear()
-
-
-def release_session(session_id: str) -> None:
-    """Forget the child sessions *session_id*'s run claimed.
-
-    Called when a turn ends, alongside L1's and L3's own release.  Without it a
-    finished run keeps its claim forever, and a later channel reusing the same
-    child id would be refused as ambiguous for the rest of the process.
-    """
-    with _ORIGIN_GUARD:
-        for child in [
-            child
-            for child, origins in _SUBAGENT_ORIGIN.items()
-            if session_id in origins
-        ]:
-            origins = _SUBAGENT_ORIGIN[child]
-            origins.discard(session_id)
-            if not origins:
-                del _SUBAGENT_ORIGIN[child]
+    _state.reset()
 
 
 # --------------------------------------------------------------------------- #
-# Session resolution (INV-1, and the sub-agent boundary)
+# Seams (bound by NAME so a test can substitute them without patching imports)
 # --------------------------------------------------------------------------- #
 
 
-#: The channel behind an INV-1 session id, or ``None`` if it is not one.
-#:
-#: Deliberately strict, and deliberately the SAME callable L5 routes output
-#: with (:mod:`.session_ids`).  When L1 has already rolled back, the core calls
-#: this backend positionally with three arguments and ``sid`` silently receives
-#: the TITLE string (measured, INV-7 clause 5) — ``"Shell Command"`` must fail
-#: this check, which is what turns that misbinding into a refusal instead of a
-#: misrouted gate.
-_channel_id_of = channel_id_of
-_is_discord_session = is_session_id
+def _active_client() -> Any:
+    """C2, or ``None`` when this session has no broker (INV-C19)."""
+    from . import client
+
+    return client.active_client()
 
 
-def _remember_origin(child_sid: str, origin_sid: str) -> None:
-    """Record that *child_sid* belongs to the run *origin_sid* started.
+def _prompt_factory(gate: Gate) -> Any:
+    return approvals_prompt.TerminalPrompt(gate.title, gate.message, gate.preview)
 
-    Every run adds its own claim; a claim is never skipped because the id is
-    already known.  Two live claimants make the id unattributable rather than
-    silently rebinding it to whoever stamped last.
+
+def _stdin_is_interactive() -> bool:
+    return approvals_prompt.stdin_is_interactive()
+
+
+def _set_core_flag(value: bool) -> None:
+    """Set the core's ``awaiting_user_input`` flag.  Called OUTSIDE the lock.
+
+    ``notify=True`` is binding: our gates are agent-initiated.  ``notify=False``
+    is for user-initiated menus (``/model``) and would clear
+    ``_AWAITING_USER_INPUT_NOTIFY`` process-wide (``command_runner.py:326-329``),
+    undermining AC-22.
     """
-    with _ORIGIN_GUARD:
-        origins = _SUBAGENT_ORIGIN.get(child_sid)
-        if origins is None:
-            origins = set()
-            _SUBAGENT_ORIGIN[child_sid] = origins
-        origins.add(origin_sid)
-        _SUBAGENT_ORIGIN.move_to_end(child_sid)
-        while len(_SUBAGENT_ORIGIN) > _MAX_TRACKED_SUBAGENTS:
-            _SUBAGENT_ORIGIN.popitem(last=False)
+    from code_puppy.tools.command_runner import set_awaiting_user_input
+
+    set_awaiting_user_input(value, notify=True)
 
 
-def _origin_of(child_sid: str) -> Optional[str]:
-    """The single Discord session that claimed *child_sid*, else ``None``."""
-    with _ORIGIN_GUARD:
-        origins = _SUBAGENT_ORIGIN.get(child_sid)
-        if origins is None or len(origins) != 1:
-            return None
-        return next(iter(origins))
+def _after_gate_posted(gate: Gate) -> None:
+    """Seam between posting a gate and starting the prompt.
 
-
-def _resolve_session(session_id: Any) -> Optional[str]:
-    """Map any session id onto the Discord session that must answer for it.
-
-    ``None`` means "not attributable" — the caller then refuses (INV-3).  A gate
-    nobody can be held to is not a gate.
-
-    Argument-driven on purpose: it answers "who answers for THIS id", so a
-    stray non-session argument (INV-7 clause 5's title string) can never be
-    resolved out of ambient state.  Callers that mean "who answers for the code
-    running right now" use :func:`_current_session`.
+    Production does nothing here.  It exists because AC-64a's window --
+    Discord resolving while the mark is still EMPTY -- is otherwise only
+    reachable by winning a race, and a test that hopes for an interleave
+    proves nothing.
     """
-    if _is_discord_session(session_id):
-        return session_id
-    if isinstance(session_id, str) and session_id:
-        return _origin_of(session_id)
-    return None
-
-
-def _current_session() -> Optional[str]:
-    """The Discord session for the code running right now, or ``None``.
-
-    Only valid on the gateway loop; the executor-side backend is handed its id
-    by L1 patch C instead (INV-6/INV-7).
-
-    Order is load-bearing.  An active ``session_scope`` is authoritative, then
-    the ContextVar — which is context-LOCAL and therefore right for this run
-    even when another channel's sub-agent happens to use the same child id.
-    The shared map is the last resort only; asking it first routes this
-    channel's gate into whichever channel stamped that id last.
-    """
-    current = concurrency.current_session_id()
-    if _is_discord_session(current):
-        return current
-    origin = _ORIGIN_SID.get()
-    if origin is not None:
-        return origin
-    return _resolve_session(current)
 
 
 # --------------------------------------------------------------------------- #
-# Posting and resolving a gate — runs ON the gateway loop
-# --------------------------------------------------------------------------- #
-
-
-async def _request_approval(
-    session_id: str, title: str, message: str, preview: Optional[str] = None
-) -> bool:
-    """Post a gate to *session_id*'s channel and wait for the verdict.
-
-    Runs on the gateway loop.  Returns ``False`` on every failure path (INV-3):
-    unroutable session, unknown principal, Discord error, timeout.  The widget
-    itself lives in :mod:`.approvals_ui`; this function owns only the decision
-    of whether a gate may be opened and what its outcome means.
-    """
-    channel_id = _channel_id_of(session_id)
-    if channel_id is None:
-        logger.warning("Discord: refusing an approval for session %r", session_id)
-        return False
-
-    try:
-        gate = authz.open_gate(session_id, title=title, timeout_s=GATE_TIMEOUT_SECONDS)
-    except authz.AuthzError:
-        logger.warning("Discord: no principal owns %s; refusing the gate", session_id)
-        return False
-
-    try:
-        pending = await approvals_ui.post_gate(
-            channel_id, gate, title, message, preview
-        )
-    except Exception:
-        logger.exception("Discord: could not post the approval gate; denying")
-        authz.close_gate(gate.gate_id)
-        return False
-
-    try:
-        return await asyncio.wait_for(pending.future, GATE_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        # R3: an expired gate is an explicit rejection and is reported as one.
-        # It never just disappears from the channel.
-        authz.close_gate(gate.gate_id)
-        await approvals_ui.finish_message(
-            pending, f"**EXPIRED — treated as DENIED** — {title}"
-        )
-        return False
-    except asyncio.CancelledError:
-        # A cancellation is NOT a timeout, and the difference is the whole
-        # point of ``/cancel``.  Returning ``False`` here would swallow it:
-        # ``wait_for`` delivers the ``CancelledError`` to us, and once it is
-        # caught nothing is pending any more — so ``cancel_channel`` would
-        # merely deny this one gate while the run carried on to its next tool
-        # and its next gate, exactly when the abort matters most (an open
-        # ``rm -rf`` gate).  It belongs to whoever cancelled us, so it is
-        # re-raised; the channel is told the truth rather than "EXPIRED".
-        authz.close_gate(gate.gate_id)
-        await approvals_ui.finish_message(pending, f"**CANCELLED** — {title}")
-        raise
-    except Exception:
-        logger.exception("Discord: approval gate failed; denying")
-        return False
-    finally:
-        approvals_ui.forget(gate.gate_id)
-
-
-# --------------------------------------------------------------------------- #
-# Path 1 — the approval backend (file operations), called off-loop
+# The backend (§5.2) -- runs on an executor thread, with no loop of its own
 # --------------------------------------------------------------------------- #
 
 
 def approval_backend(
-    sid: Optional[str] = None,
-    title: str = "",
-    message: str = "",
-    preview: Optional[str] = None,
+    title: str = "", message: str = "", preview: Optional[str] = None
 ) -> Tuple[bool, Optional[str]]:
-    """Bridge a core approval onto Discord.  Synchronous, blocks its thread.
+    """Bridge one core approval onto BOTH paths.  Blocks its own thread.
 
-    Four arguments by INV-7 clause 1; L1 patch C binds ``sid`` on the loop and
-    hands the core the 3-arg shape it expects.  ``sid`` carries a default so a
-    stray 3-arg call degrades into a refusal rather than a ``TypeError`` — the
-    refusal then comes from the unroutable id, not from a ``None`` check
-    (measured, clause 5).
-
-    Feedback is always ``None``: two buttons are a yes/no, not a text channel.
+    Feedback is always ``None``: two buttons are a yes/no, not a text channel,
+    and offering feedback on one branch only would make the answer depend on
+    which branch happened to win.
     """
-    loop = gateway.get_loop()
-    if loop is None:
-        logger.warning("Discord: no gateway loop; denying an approval")
-        return False, None
-
-    # Blocking on our own loop would deadlock the gateway: nothing could ever
-    # service the click we are waiting for.
+    gate = _open_gate(title, message, preview)
     try:
-        running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
-    except RuntimeError:
-        running = None
-    if running is loop:
-        logger.error("Discord: approval backend hit on the gateway loop; denying")
-        return False, None
+        remote = _start_discord_branch(gate)
+        _after_gate_posted(gate)
+        local = _run_terminal_branch(gate)
+        if not remote and not local:
+            # Neither branch ever existed: nobody could have said yes.  This
+            # is the ONLY fail-closed path (INV-C7, AC-33/35).
+            logger.warning("cp_discord: no approval path available; denying %s", title)
+            return False, None
+        return _await_resolution(gate), None
+    finally:
+        _close_gate(gate)
 
-    session_id = _resolve_session(sid)
-    if session_id is None:
-        logger.warning("Discord: approval for unattributable session %r", sid)
-        return False, None
 
-    future = asyncio.run_coroutine_threadsafe(
-        _request_approval(session_id, title, message, preview), loop
+approval_backend._cp_discord = True  # the SENTINEL, see above
+
+
+def _open_gate(title: str, message: str, preview: Optional[str]) -> Gate:
+    gate = Gate(
+        gate_id=str(uuid.uuid4()), title=title, message=message, preview=preview
     )
-    try:
-        allowed = future.result(GATE_TIMEOUT_SECONDS + _RESULT_GRACE_SECONDS)
-    except Exception:
-        # Includes TimeoutError. Abandon the request so it cannot linger on the
-        # loop with nobody listening.
-        future.cancel()
-        logger.exception("Discord: approval bridge failed; denying")
-        return False, None
-    return bool(allowed), None
+    _state.add(gate)
+    _report("gate_opened")
+    return gate
 
 
-approval_backend._cp_discord = True  # INV-7 clause 1: patch C only wraps ours
+def _close_gate(gate: Gate) -> None:
+    """Forget the gate and tell C3 it is over.  Runs on EVERY exit."""
+    _state.drop(gate.gate_id)
+    _report("gate_closed")
 
 
-# --------------------------------------------------------------------------- #
-# Path 2 — the shell hook.  Without this, shell runs UNCHECKED.
-# --------------------------------------------------------------------------- #
+# -- branch 1: Discord -----------------------------------------------------
 
 
-async def on_run_shell_command(
-    context: Any, command: str, cwd: Optional[str] = None, timeout: int = 60
-) -> Optional[Dict[str, Any]]:
-    """Gate every shell command through Discord.
+def _start_discord_branch(gate: Gate) -> bool:
+    """Put the gate in the thread.  ``False`` means the phone cannot answer.
 
-    ``None`` allows, a ``blocked`` dict refuses.  This never consults the
-    approval-bypass setting — that omission IS the enforcement for this path
-    (L3/R4), because the core's own bypass branch is upstream of us and is
-    simply not reached headless.
-
-    **The hook owns its own failures.**  ``_trigger_callbacks`` catches every
-    exception and appends ``None`` (``callbacks.py:321-326``), and the runner
-    reads anything that is not a ``blocked`` dict as permission to execute
-    (``command_runner.py:1099-1112``).  So an escaping raise is not a crash
-    here — it is an *ungated command*.  Letting the dispatcher "handle" it
-    would make this seam fail OPEN, which is the one thing it must never do.
+    A failed HINWEG is NOT a failure and NOT a branch winner (INV-C1, AC-92):
+    it only means this gate has to be answered at the machine.
     """
+    client = _active_client()
+    if client is None:
+        gate.discord_alive = False
+        return False
     try:
-        session_id = _current_session()
-        if session_id is None:
-            return _blocked(
-                "No Discord session could be attributed to this command, so no "
-                "one could approve it."
-            )
-        # Escaped, not interpolated: a backtick in the command would otherwise
-        # close the code span and let the rest render as markdown — forging the
-        # very message the human bases the decision on.
-        rendered = approvals_ui.inline_code(command)
-        approved = await _request_approval(session_id, "Shell Command", rendered)
-    except Exception:
-        # Deliberately NOT ``BaseException``: ``CancelledError`` must keep
-        # propagating, or /cancel would be swallowed here instead of at the
-        # gate — the same defect one layer up.
-        logger.exception("Discord: the shell gate failed; blocking the command")
-        return _blocked("The Discord approval gate failed, so nothing was run.")
-    if approved:
-        return None
-    return _blocked("The command was denied in Discord.")
-
-
-def _blocked(reason: str) -> Dict[str, Any]:
-    return {
-        "blocked": True,
-        "error_message": f"Command blocked: {reason}",
-        "reasoning": reason,
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Path 2b — the file callback, for when the core short-circuits
-# --------------------------------------------------------------------------- #
-
-
-async def on_file_permission(
-    context: Any,
-    file_path: str,
-    operation: str,
-    preview: Optional[str] = None,
-    message_group: Optional[str] = None,
-    operation_data: Any = None,
-) -> Optional[bool]:
-    """Raise a file gate only when the core would otherwise skip its own.
-
-    Tri-state (``tools/file_modifications.py:42-48``): ``False`` denies, ``True``
-    approves, ``None`` is no opinion.  Abstaining is the normal case — the
-    backend above already gates file operations, and since every registered
-    callback runs, an always-on answer here would ask the user twice for one
-    operation (AC-52).
-
-    That tri-state is also why this hook guards itself, exactly as the shell
-    hook does: ``_permission_denied`` denies only on an explicit ``False``
-    (``file_modifications.py:42-48``), so the ``None`` the dispatcher appends
-    for a raising callback reads as "no opinion" — and while yolo is on this
-    callback is the ONLY gate on the file path (``authz.file_gate_callback_
-    active``), so failing open here means an ungated write.
-    """
-    try:
-        if not authz.file_gate_callback_active():
-            return None
-        session_id = _current_session()
-        if session_id is None:
-            return False
-        return await _request_approval(
-            session_id,
-            "File Operation",
-            f"{operation} {approvals_ui.inline_code(file_path)}",
-            preview,
+        delivered = client.submit_gate(
+            gate.gate_id,
+            gate.title,
+            gate.message,
+            preview=gate.preview,
+            remote_resolvable=True,
         )
     except Exception:
-        # Again not ``BaseException``: a cancellation belongs to the caller.
-        logger.exception("Discord: the file gate failed; denying the operation")
+        logger.debug("cp_discord: submitting a gate failed", exc_info=True)
+        delivered = False
+    gate.discord_alive = bool(delivered)
+    if delivered:
+        gate.timer = threading.Timer(GATE_TIMEOUT_SECONDS, _expire, args=(gate,))
+        gate.timer.daemon = True
+        gate.timer.start()
+    return gate.discord_alive
+
+
+def _expire(gate: Gate) -> None:
+    """The 120 s deadline: ends the DISCORD branch, nothing else (INV-C10).
+
+    Not a winner, not an exit: the mark and the slot stay, because the
+    terminal prompt is still open (AC-49).  Giving them back here would let a
+    concurrent approval put a SECOND Application on the same stdin.
+    """
+    if not _state.expire(gate):
+        return
+    _tell_channel(gate, GATE_EXPIRED)
+    _state.wake()
+
+
+# -- branch 2: the terminal ------------------------------------------------
+
+
+def _run_terminal_branch(gate: Gate) -> bool:
+    """Start the prompt, unless we may not or cannot.  Returns whether it ran.
+
+    Three refusals, all deliberate:
+
+    * stdin is not interactive -- the core would have refused too, and we
+      stand BEFORE its check (INV-C19's stdin clause, AC-86);
+    * the slot is taken -- another approval owns stdin, and a second
+      Application would fight it (INV-C29 rule 4, AC-80);
+    * the gate is already resolved -- §5.2a step 2: no prompt at all.
+    """
+    if not _stdin_is_interactive() or not _state.acquire_slot(gate):
         return False
+    _flag_step(+1)
+    threading.Thread(
+        target=_drive_prompt, args=(gate,), name="cp_discord-approval", daemon=True
+    ).start()
+    return True
 
 
-# --------------------------------------------------------------------------- #
-# Path 3 — tool gating and the sub-agent session bridge
-# --------------------------------------------------------------------------- #
+def _drive_prompt(gate: Gate) -> None:
+    """Own the prompt from build to release.  Runs on its own thread.
 
-
-def _stamp_origin() -> None:
-    """Learn who this work belongs to, while the loop still knows.
-
-    On a normal turn the current id IS the Discord session, so we record it.
-    Inside a sub-agent it is the child id instead — then we bind that child to
-    the origin we inherited through the context copy, which is what lets the
-    sub-agent's gates reach the triggering channel (AC-40).
+    Off the backend's thread on purpose: the backend has to stay free to
+    notice a Discord resolution, and a prompt that owned the waiting thread
+    would make the phone wait for the terminal (AC-84).
     """
     try:
-        current = concurrency.current_session_id()
-        if _is_discord_session(current):
-            _ORIGIN_SID.set(current)
-            return
-        origin = _ORIGIN_SID.get()
-        if origin is not None and isinstance(current, str) and current:
-            _remember_origin(current, origin)
+        prompt = _prompt_factory(gate)
+        answer = prompt.run(on_live=lambda: _state.go_live(gate, prompt))
+        if answer is not None:
+            _resolve(gate, bool(answer), winner=WINNER_TERMINAL)
     except Exception:
-        logger.debug("Discord: could not stamp the session origin", exc_info=True)
+        # A branch that cannot run is a branch ABORT, never a rejection: the
+        # human may be standing in front of the gate on their phone (AC-33).
+        logger.warning("cp_discord: the terminal approval branch failed", exc_info=True)
+    finally:
+        if _state.release_slot(gate):
+            _flag_step(-1)
+        _state.wake()
+
+
+# -- the race --------------------------------------------------------------
+
+
+def _resolve(gate: Gate, approved: bool, *, winner: str) -> bool:
+    """The CAS.  ``True`` for the winner, ``False`` for everybody after.
+
+    The ``exit()`` happens AFTER the lock is released (INV-C29 rule 2): it
+    reaches into another thread's event loop, and holding a lock across that
+    is how the phone ends up waiting for the terminal.
+    """
+    won, prompt = _state.resolve(gate, approved, winner)
+    if won and prompt is not None:
+        prompt.exit_with(approved)
+    return won
+
+
+def _await_resolution(gate: Gate) -> bool:
+    """§5.2 step 3: wait for the first answer.  OUTSIDE every lock.
+
+    Fail-closed only once BOTH branches are done without a winner (INV-C7):
+    an exception in the terminal branch, or an expired Discord branch, is an
+    abort -- not a rejection.
+    """
+    while gate.resolution is None:
+        if not gate.discord_alive and not _state.owns_slot(gate):
+            logger.info("cp_discord: both approval branches ended without an answer")
+            return False
+        _state.wait(_WAIT_TICK)
+
+    if gate.winner == WINNER_TERMINAL:
+        _tell_channel(gate, DECIDED_IN_TERMINAL)
+    return bool(gate.resolution)
+
+
+def _tell_channel(gate: Gate, outcome: str) -> None:
+    """Close the gate in the thread.  Never raises (INV-C1)."""
+    if not gate.discord_alive and outcome == DECIDED_IN_TERMINAL:
+        return
+    client = _active_client()
+    if client is None:
+        return
+    try:
+        client.close_gate(gate.gate_id, outcome, title=gate.title)
+    except Exception:
+        logger.debug("cp_discord: closing a gate in Discord failed", exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# The return channel (§3.2a) -- runs on C2's listener thread
+# --------------------------------------------------------------------------- #
+
+
+def on_gate_resolved(
+    gate_id: Any = None, decision: Any = None, discord_user_id: Any = None
+) -> Optional[str]:
+    """A click came back from Discord.  Returns a refusal, or ``None``.
+
+    Authorization happens HERE, not in the broker (§3.2a): the bindings
+    database belongs to the session.  And it checks the APPROVER role ONLY --
+    ``authz.open_gate``/``authorize_resolution`` demand a session principal
+    and a requester identity (``authz.py:228-230``, ``:295``) that a session
+    started at a terminal never has, so every gate would be refused (INV-C25).
+
+    ``check_message`` is deliberately not consulted: that tests TALKER, and
+    the two axes are independent -- somebody listed only in
+    ``DISCORD_APPROVERS`` must still be able to approve (AC-75).
+    """
+    gate = _state.get(gate_id)
+    if gate is None or gate.resolved:
+        return approvals_ui.ALREADY_DECIDED
+
+    principal = _principal_for(discord_user_id)
+    if principal is None or not bindings.has_role(principal, Role.APPROVER):
+        # The gate stays OPEN: an outsider's click must not consume somebody
+        # else's pending approval (AC-74).
+        return "You may not answer this request."
+
+    if not _resolve(gate, decision == DECISION_APPROVE, winner=WINNER_REMOTE):
+        return approvals_ui.ALREADY_DECIDED
+    # Off this thread: we are ON the session's inbound listener, and the
+    # broker budgets 100 ms for the whole hop (INV-C17).  ``close_gate`` is a
+    # socket round trip BACK to that broker -- up to 1.5 s if it just died,
+    # which is exactly when a phone click matters.  Answering late would make
+    # a LIVE session look unreachable and get its thread archived (AC-15).
+    _in_background(_tell_channel, gate, DECIDED_IN_DISCORD)
+    return None
+
+
+def _principal_for(discord_user_id: Any) -> Optional[str]:
+    """The principal behind a Discord id, or ``None`` for a stranger."""
+    if not discord_user_id:
+        return None
+    try:
+        return bindings.resolve_principal(constants.AUTHZ_CHANNEL, str(discord_user_id))
+    except Exception:
+        logger.debug("cp_discord: resolving a principal failed", exc_info=True)
+        return None
+
+
+def _in_background(call: Any, *args: Any) -> None:
+    """Run *call* on a throwaway thread.  Never raises, never waits."""
+
+    def run() -> None:
+        try:
+            call(*args)
+        except Exception:
+            logger.debug("cp_discord: a background gate step failed", exc_info=True)
+
+    threading.Thread(target=run, name="cp_discord-gate-close", daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
+# The core flag (INV-C27) -- counted under the lock, CALLED outside it
+# --------------------------------------------------------------------------- #
+
+
+def _flag_step(delta: int) -> None:
+    """Move the waiter count and, if the truth changed, tell the core.
+
+    The setter is NOT a plain flag setter: it fans out synchronously into
+    ``on_awaiting_user_input`` on the same thread (``command_runner.py:334-340``
+    -> ``callbacks.py:519-522``), where foreign plugins can hang -- invisibly,
+    because ``:339-340`` is a bare ``except: pass``.  Calling it under our
+    lock would let foreign code decide our hold time (INV-C29).
+    """
+    transition = _state.step_flag(delta)
+    if transition is not None:
+        _apply_flag(*transition)
+
+
+def _apply_flag(generation: int, value: bool) -> None:
+    """Set the flag, unless a NEWER transition has happened meanwhile (AC-87b)."""
+    if not _state.flag_is_current(generation):
+        return
+    try:
+        _set_core_flag(value)
+    except Exception:
+        logger.debug("cp_discord: setting the core flag failed", exc_info=True)
+
+
+def _report(method: str) -> None:
+    """Tell C3 about a gate.  The core hook does NOT fire for us (INV-C24).
+
+    Once a backend is installed, ``awaiting_user_input`` stops firing for
+    shell and file approvals (``common.py:1443-1445`` returns before
+    ``:1502``), so the state the phone cares about most would be invisible.
+    """
+    reporter = _reporter
+    if reporter is None:
+        from . import reporter as reporter_module
+
+        reporter = reporter_module.active_reporter()
+    if reporter is None:
+        return
+    try:
+        getattr(reporter, method)()
+    except Exception:
+        logger.debug("cp_discord: reporting %s failed", method, exc_info=True)
 
 
 async def on_pre_tool_call(
     tool_name: str, tool_args: Dict[str, Any], context: Any = None
 ) -> Optional[Dict[str, Any]]:
-    """Block what cannot be answered or gated, and keep the bridge current.
+    """Block what the phone could see but never answer (INV-C16, AC-61).
 
-    Two refusals, for two different reasons.  An interactive picker has no
-    surface over Discord at all; ``universal_constructor`` has one, but it
-    reaches neither approval seam, so allowing it would mean arbitrary code
-    execution with no gate anywhere (see :data:`_UNGATEABLE_BLOCK`).
+    Only while a broker is reachable: without one this is an ordinary terminal
+    session, and taking a working tool away from it would be a regression the
+    plugin has no business causing (INV-C19).
     """
-    _stamp_origin()
-    if tool_name in _INTERACTIVE_TOOLS:
+    if tool_name in _INTERACTIVE_TOOLS and _active_client() is not None:
         return dict(_INTERACTIVE_BLOCK)
-    if tool_name in _UNGATEABLE_TOOLS:
-        logger.warning("Discord: refusing ungateable tool %r", tool_name)
-        return dict(_UNGATEABLE_BLOCK)
     return None
 
 
 # --------------------------------------------------------------------------- #
-# Lifecycle (INV-5 / INV-7 clause 5)
+# Lifecycle
 # --------------------------------------------------------------------------- #
 
-_HOOKS = (
-    ("run_shell_command", on_run_shell_command),
-    ("file_permission", on_file_permission),
-    ("pre_tool_call", on_pre_tool_call),
-)
+_HOOKS = (("pre_tool_call", on_pre_tool_call),)
 
 
-def install() -> None:
-    """Install both approval paths.  Idempotent; refuses to evict a stranger.
+def install(config: Any = None) -> None:
+    """Install the backend.  Idempotent; refuses to evict a stranger.
 
     ``_APPROVAL_BACKEND`` is a one-slot global with no chaining
-    (``tools/common.py:98``).  Overwriting an occupied slot would silently
-    switch another frontend off, so an unknown occupant is a loud failure.  Our
-    own backend is recognised by its sentinel — including through L1 patch C's
-    closure, which inherits it (INV-7 clause 1); without that, a re-install
-    could never succeed.
+    (``common.py:98``), so overwriting an occupant would silently switch
+    another frontend off.  Ours is recognised by its sentinel -- kept as
+    SELF-protection (a double load must be loud), not as a boundary against
+    some other plugin: there is no other plugin any more.
     """
-    global _INSTALLED, _PREVIOUS_BACKEND
+    global _installed, _previous_backend
     from code_puppy.tools.common import get_approval_backend, set_approval_backend
 
     existing = get_approval_backend()
-    if existing is not None and not getattr(existing, concurrency.SENTINEL, False):
+    if existing is not None and not getattr(existing, SENTINEL, False):
         raise ApprovalError(
             "another approval backend is already installed "
             f"({getattr(existing, '__name__', existing)!r}); refusing to "
             "replace it, which would silently disable that frontend"
         )
 
-    if not _INSTALLED:
-        _PREVIOUS_BACKEND = existing
+    if not _installed:
+        _previous_backend = existing
     set_approval_backend(approval_backend)
-
     for phase, handler in _HOOKS:
-        register_callback(phase, handler)  # duplicate registration is a no-op
-    _INSTALLED = True
+        register_callback(phase, handler)
+    _installed = True
+    _wire_return_channel(on_gate_resolved)
+    logger.debug("cp_discord: C4 approval switch installed")
 
 
 def uninstall() -> None:
-    """Restore the previous state.  MUST run before L1 rolls patch C back.
-
-    Otherwise ``_APPROVAL_BACKEND`` still holds our 4-arg callable while the
-    core calls it with three again — a misbinding that would route gates by a
-    title string (INV-7 clause 5).
-    """
-    global _INSTALLED, _PREVIOUS_BACKEND
+    """Take C4 down.  Never raises: teardown must reach every layer."""
+    global _installed, _previous_backend
     from code_puppy.tools.common import get_approval_backend, set_approval_backend
 
     for phase, handler in _HOOKS:
         try:
             unregister_callback(phase, handler)
         except Exception:
-            logger.debug("Discord: unregistering %s failed", phase, exc_info=True)
+            logger.debug("cp_discord: unregistering %s failed", phase, exc_info=True)
 
+    _wire_return_channel(None)
     try:
         current = get_approval_backend()
-        if current is None or getattr(current, concurrency.SENTINEL, False):
-            set_approval_backend(_PREVIOUS_BACKEND)
+        if current is None or getattr(current, SENTINEL, False):
+            set_approval_backend(_previous_backend)
     except Exception:
-        logger.exception("Discord: could not restore the approval backend")
+        logger.exception("cp_discord: could not restore the approval backend")
 
-    _PREVIOUS_BACKEND = None
-    _INSTALLED = False
+    _previous_backend = None
+    _installed = False
+    set_reporter(None)
     reset_state()
+
+
+def _wire_return_channel(handler: Any) -> None:
+    """Point C2's listener at us, or at nothing.  Never raises.
+
+    This one line is what makes the Discord branch exist at all: without it
+    every click is refused with ``no_handler`` and every test here still
+    passes, because nothing else touches the listener.
+    """
+    try:
+        client = _active_client()
+        if client is not None:
+            client.set_resolution_handler(handler)
+    except Exception:
+        logger.debug("cp_discord: wiring the return channel failed", exc_info=True)
+
+
+__all__: Sequence[str] = (
+    "DECIDED_IN_DISCORD",
+    "DECIDED_IN_TERMINAL",
+    "GATE_EXPIRED",
+    "GATE_TIMEOUT_SECONDS",
+    "MARK_EMPTY",
+    "MARK_LIVE",
+    "MARK_PENDING",
+    "SENTINEL",
+    "WINNER_REMOTE",
+    "WINNER_TERMINAL",
+    "ApprovalError",
+    "Gate",
+    "approval_backend",
+    "flag_generation",
+    "install",
+    "live_application",
+    "on_gate_resolved",
+    "on_pre_tool_call",
+    "open_gates",
+    "prompt_mark",
+    "prompt_slot",
+    "reset_state",
+    "set_reporter",
+    "state_lock_held_by_me",
+    "uninstall",
+)

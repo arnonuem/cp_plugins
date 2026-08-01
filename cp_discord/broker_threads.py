@@ -35,13 +35,21 @@ must not learn about it.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
 
 #: Re-exported so that ``broker_threads`` stays the single entry point for the
-#: C1 layer: :mod:`.broker_server` and the suites reach the registry through
-#: this module, and the split is a file boundary, not an API change.
+#: C1 layer: :mod:`.broker_server` and the suites reach the registry and the
+#: naming rules through this module, and each split is a file boundary, not an
+#: API change.
+from . import approvals_ui
+from .broker_gates import GateBoard, PostedGate, ViewFactory
+from .broker_naming import (  # noqa: F401
+    derive_title,
+    detect_branch,
+    disambiguate,
+    session_title,
+)
 from .broker_registry import (  # noqa: F401
     HEARTBEAT_GRACE,
     SessionRecord,
@@ -60,61 +68,6 @@ AUTO_ARCHIVE_MAX = 10080
 #: tell OUR archiving apart from Discord's own.
 ARCHIVE_REASON = "cp_discord: session ended"
 REVIVE_REASON = "cp_discord: session is active again"
-
-
-def detect_branch(cwd: str) -> Optional[str]:
-    """The current git branch, or ``None``.
-
-    Delegates to the core's ``statusline.payload.detect_git_branch`` rather
-    than shelling out again: that one already carries a Windows fix (reader
-    threads deadlocking a ``capture_output`` call from inside a hook) which
-    this module would otherwise have to rediscover.
-    """
-    from code_puppy.plugins.statusline.payload import detect_git_branch
-
-    return detect_git_branch(cwd)
-
-
-def session_title(
-    cwd: str, *, branch: Optional[str], override: Optional[str] = None
-) -> str:
-    """``<directory>/<branch>``, or *override* if one was given (§3.3).
-
-    The branch part is simply absent outside a repository (AC-10) -- not
-    ``None``, not ``unknown``: a title is read by a human on a phone.
-    """
-    if override and override.strip():
-        return override.strip()
-    directory = os.path.basename(os.path.abspath(cwd)) or cwd
-    if branch and branch.strip():
-        return f"{directory}/{branch.strip()}"
-    return directory
-
-
-def derive_title(cwd: str, override: Optional[str]) -> str:
-    """:func:`session_title` with the branch looked up, failures included.
-
-    A missing, broken or slow git is not a reason to have no title (INV-C1).
-    """
-    if override and override.strip():
-        return override.strip()
-    try:
-        branch = detect_branch(cwd)
-    except Exception:
-        logger.debug("cp_discord: branch detection failed", exc_info=True)
-        branch = None
-    return session_title(cwd, branch=branch)
-
-
-def disambiguate(title: str, taken: Iterable[str]) -> str:
-    """*title*, suffixed with ``#n`` if it is already in use (AC-11)."""
-    used = set(taken)
-    if title not in used:
-        return title
-    index = 1
-    while f"{title} #{index}" in used:
-        index += 1
-    return f"{title} #{index}"
 
 
 class ThreadManager:
@@ -160,6 +113,9 @@ class ThreadManager:
         """Drop the mapping without archiving (the session moved on)."""
         self._threads.pop(session_id, None)
         self._titles.pop(session_id, None)
+
+    def has_thread(self, session_id: str) -> bool:
+        return session_id in self._threads
 
     # -- lifecycle ------------------------------------------------------
 
@@ -223,6 +179,65 @@ class ThreadManager:
         if thread is None:
             return
         await self._post_to(thread, body)
+
+    async def post_gate(
+        self,
+        session_id: str,
+        gate_id: str,
+        body: str,
+        view_factory: Optional[ViewFactory],
+        board: GateBoard,
+    ) -> None:
+        """Post a gate into the session's thread, with its buttons (§3.2b).
+
+        The view is built HERE, not by the caller: py-cord's ``View`` takes
+        the running loop in its constructor, and the only loop that exists is
+        this one.  *view_factory* is ``None`` for a gate the phone cannot
+        answer -- then this is an ordinary, button-less post (INV-C23, AC-91).
+
+        Deliberately NOT chunked: the buttons live on ONE message, and a gate
+        split across two would put them under a fragment.  The body is capped
+        by :func:`.approvals_ui.gate_text` instead, which is where the caller
+        can see the limit.
+        """
+        thread = self._threads.get(session_id)
+        if thread is None or board.is_open(session_id, gate_id):
+            return
+        view = (
+            None
+            if view_factory is None
+            else view_factory(lambda: board.claim(session_id, gate_id))
+        )
+        try:
+            await self._revive(thread)
+            message = await thread.send(
+                body[:_GATE_BODY_LIMIT],
+                view=view,
+                allowed_mentions=approvals_ui.allowed_mentions(),
+            )
+        except Exception:
+            logger.debug("cp_discord: posting a gate failed", exc_info=True)
+            return
+        board.remember(session_id, gate_id, PostedGate(message=message, view=view))
+
+    async def finish_gate(
+        self, session_id: str, gate_id: str, outcome: str, board: GateBoard
+    ) -> None:
+        """Write the outcome onto the gate message and kill its buttons.
+
+        Falls back to a plain post when the gate is not on the board: a
+        decision the channel never learns about is how somebody ends up
+        tapping at a message that was answered ten minutes ago.
+        """
+        posted = board.take(session_id, gate_id)
+        if posted is None:
+            await self.post(session_id, outcome)
+            return
+        approvals_ui.disable(posted.view)
+        try:
+            await posted.message.edit(content=outcome, view=posted.view)
+        except Exception:
+            logger.debug("cp_discord: finalising a gate failed", exc_info=True)
 
     async def post_channel(self, body: str) -> None:
         """Post *body* into the CHANNEL itself (AC-60b, AC-71b).
@@ -294,6 +309,7 @@ class DiscordGateway:
 
     def __init__(self) -> None:
         self._manager = ThreadManager(self._channel)
+        self._board = GateBoard()
         self._channel_object: Optional[Any] = None
         self._loop: Optional[Any] = None
         self._own_loop_thread: Optional[threading.Thread] = None
@@ -413,13 +429,38 @@ class DiscordGateway:
     def open_thread(self, session_id: str, title: str) -> None:
         self._schedule(lambda: self._manager.ensure_thread(session_id, title))
 
+    def gate_board(self) -> GateBoard:
+        """Which gate owns which message.  The broker hands it to the views."""
+        return self._board
+
     def post(self, session_id: str, body: str) -> None:
         self._schedule(lambda: self._manager.post(session_id, body))
+
+    def post_gate(
+        self,
+        session_id: str,
+        gate_id: str,
+        body: str,
+        view_factory: Optional[ViewFactory],
+    ) -> None:
+        """Queue a gate for the session's thread (§3.2b).  Returns at once."""
+        self._schedule(
+            lambda: self._manager.post_gate(
+                session_id, gate_id, body, view_factory, self._board
+            )
+        )
+
+    def finish_gate(self, session_id: str, gate_id: str, outcome: str) -> None:
+        """Queue the closing edit for a gate.  Returns at once."""
+        self._schedule(
+            lambda: self._manager.finish_gate(session_id, gate_id, outcome, self._board)
+        )
 
     def post_channel(self, body: str) -> None:
         self._schedule(lambda: self._manager.post_channel(body))
 
     def archive(self, session_id: str) -> None:
+        self._board.forget_session(session_id)
         self._schedule(lambda: self._manager.archive(session_id))
 
     def close(self) -> None:
@@ -485,6 +526,10 @@ _STOP = object()
 #: entries go: the newest state of a session is the one worth posting.
 _MAX_PENDING_JOBS = 200
 
+#: A gate lives on ONE message (its buttons cannot be split across two), so
+#: the body is capped at Discord's limit rather than chunked.
+_GATE_BODY_LIMIT = 2000
+
 
 __all__: Sequence[str] = (
     "ARCHIVE_REASON",
@@ -492,6 +537,7 @@ __all__: Sequence[str] = (
     "HEARTBEAT_GRACE",
     "REVIVE_REASON",
     "DiscordGateway",
+    "GateBoard",
     "SessionRecord",
     "SessionRegistry",
     "ThreadManager",

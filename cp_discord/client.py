@@ -50,6 +50,9 @@ from .broker_server import (
     ELECTION_RETRY_DELAY,
     ERR_UNAUTHORIZED,
     ERR_UNKNOWN_SESSION,
+    GATE_CLOSED,
+    GATE_OPEN,
+    M_GATE,
     M_HEARTBEAT,
     M_REGISTER,
     M_RELEASE,
@@ -186,6 +189,62 @@ class SessionClient:
             self._send(method, params)
         except Exception:
             logger.debug("cp_discord: delivering %r failed", event, exc_info=True)
+
+    # -- gates: the HINWEG (§3.2b) --------------------------------------
+
+    def submit_gate(
+        self,
+        gate_id: str,
+        title: str,
+        body: str,
+        *,
+        preview: Optional[str] = None,
+        remote_resolvable: bool = True,
+    ) -> bool:
+        """Put a gate into this session's thread.  Returns whether it landed.
+
+        C4 calls THIS, never the socket: the client stays the only thing that
+        knows the wire format, so there is one place where a frame is built.
+
+        ``False`` means "this gate cannot be answered from the phone" -- no
+        broker, no thread, Discord down.  It is emphatically not an error
+        (INV-C1, AC-92): the terminal prompt runs regardless, and a failed
+        HINWEG is not a branch winner.
+
+        *remote_resolvable* travels because only C4 knows it, and the broker
+        needs it to decide whether to attach buttons at all (INV-C23, AC-91).
+        """
+        return self._send_gate(
+            gate_id,
+            {
+                "status": GATE_OPEN,
+                "title": title,
+                "body": body,
+                "preview": preview,
+                "remote_resolvable": bool(remote_resolvable),
+            },
+        )
+
+    def close_gate(self, gate_id: str, outcome: str, *, title: str = "") -> bool:
+        """Tell the thread the gate is decided (AC-37, AC-39).
+
+        Same method, different ``status``: the two belong to one message, and
+        a separate method would let a gate be opened without ever being
+        closed -- leaving live buttons under a decision that already happened.
+        """
+        return self._send_gate(
+            gate_id, {"status": GATE_CLOSED, "outcome": outcome, "title": title}
+        )
+
+    def _send_gate(self, gate_id: str, params: Dict[str, Any]) -> bool:
+        """One gate frame.  NEVER raises: this sits on the approval path."""
+        try:
+            return self._send(M_GATE, {"gate_id": gate_id, **params})
+        except Exception:
+            logger.debug(
+                "cp_discord: submitting gate %s failed", gate_id, exc_info=True
+            )
+            return False
 
     # -- registration (§3.1) --------------------------------------------
 

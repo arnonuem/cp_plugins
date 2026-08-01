@@ -199,7 +199,7 @@ class InboundListener:
         if handler is None:
             return {"ok": False, "error": ERR_NO_HANDLER}
         try:
-            handler(
+            refusal = handler(
                 gate_id=params.get("gate_id"),
                 decision=params.get("decision"),
                 discord_user_id=params.get("discord_user_id"),
@@ -207,7 +207,16 @@ class InboundListener:
         except Exception:
             logger.debug("cp_discord: resolving a gate failed", exc_info=True)
             return {"ok": False, "error": ERR_BAD_REQUEST}
-        return {"ok": True}
+        answer: Dict[str, Any] = {"ok": True}
+        if isinstance(refusal, str) and refusal:
+            # The frame was TAKEN (hence ``ok``), but the click resolved
+            # nothing -- an outsider, or a gate somebody already answered.
+            # Carrying the reason back is what lets the clicker be told
+            # (AC-39/74); ``ok: False`` would instead make the broker retry a
+            # decision that has already been made, and finally declare the
+            # session unreachable (AC-85d).
+            answer["refusal"] = refusal
+        return answer
 
     def _refuse(self) -> None:
         try:

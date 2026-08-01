@@ -34,11 +34,26 @@ import logging
 import socket
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Sequence, Set
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from . import broker_election as election
-from . import broker_threads
+from . import broker_gates, broker_threads
 from .broker_election import LOOPBACK, BrokerAddress
+
+#: Re-exported so that :mod:`.broker_server` stays the single import site for
+#: the wire, exactly as it already is for ``client`` and ``client_inbound``.
+#: The values LIVE in :mod:`.broker_gates` because that is the lowest layer
+#: using them; binding them by NAME here is what keeps the two from drifting.
+from .broker_gates import (  # noqa: F401
+    GATE_CLOSED,
+    GATE_OPEN,
+    MAX_FRAME_BYTES,
+    M_RESOLVE,
+    RETRY_ATTEMPTS,
+    RETRY_DELAY,
+    SOCKET_TIMEOUT,
+    UNDELIVERABLE,
+)
 from .reporter import BLOCKED, LOCAL_ONLY_MARKER
 
 logger = logging.getLogger(__name__)
@@ -50,21 +65,14 @@ M_HEARTBEAT = "heartbeat"
 M_STATE = "state"
 M_REPORT = "report"
 M_RELEASE = "release"
-M_RESOLVE = "resolve"
+
+#: The sixth method, and the only one that carries a WIDGET rather than text
+#: (§3.2b).  Named like the rest -- a human reads these in a packet capture.
+M_GATE = "gate"
 
 ERR_UNAUTHORIZED = "unauthorized"
 ERR_UNKNOWN_SESSION = "unknown_session"
 ERR_BAD_REQUEST = "bad_request"
-
-#: A rejected delivery is retried this often, this far apart (§3.1, AC-85d).
-#: The session re-reads the portfile the moment it rejects one, so attempt two
-#: already meets the healed token.
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 1.0
-
-#: §3.2: connections are short-lived, so the timeout is a latency budget
-#: rather than a patience setting.  INV-C17 allows 100 ms for a delivery.
-SOCKET_TIMEOUT = 0.5
 
 #: §3.1 step 3/4: ten attempts, 200 ms apart, then give up for this round.
 ELECTION_ATTEMPTS = 10
@@ -72,13 +80,6 @@ ELECTION_RETRY_DELAY = 0.2
 
 #: §3.1a: how often a session re-checks the broker and its own broker thread.
 SUPERVISION_INTERVAL = 30.0
-
-#: What an undeliverable resolution says in the thread (INV-C17).
-UNDELIVERABLE = "Zustellung fehlgeschlagen — die Sitzung antwortet nicht."
-
-#: A frame longer than this is not a frame (defence against a local process
-#: feeding the broker an endless line).
-MAX_FRAME_BYTES = 1024 * 1024
 
 
 class Broker:
@@ -264,6 +265,8 @@ class Broker:
             return self._on_state(session_id, params)
         if method == M_REPORT:
             return self._on_report(session_id, params)
+        if method == M_GATE:
+            return self._on_gate(session_id, params)
         if method == M_RELEASE:
             return self._on_release(session_id)
         return {"ok": False, "error": ERR_BAD_REQUEST}
@@ -327,6 +330,31 @@ class Broker:
                 self._safely(self._gateway.post, session_id, chunk)
         return {"ok": True}
 
+    def _on_gate(self, session_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Put a gate into the thread, or finish one (§3.2b, AC-90/91).
+
+        Built like :meth:`_on_state` -- token, ``seq`` and session lookup have
+        already happened in :meth:`_handle` -- and it answers the same way: an
+        ack, no result.  The decision travels back over the return channel
+        later (§3.2a).
+
+        The Discord work goes through the same ``_safely`` as every other
+        handler: a gate that cannot be posted is a gate the phone cannot
+        answer, never an error for the session (INV-C1).
+        """
+        try:
+            well_formed = broker_gates.handle_gate(
+                session_id,
+                params,
+                gateway=self._gateway,
+                send_resolution=self.deliver_click,
+                board=self._gateway.gate_board(),
+            )
+        except Exception:
+            logger.debug("cp_discord: posting a gate failed", exc_info=True)
+            return {"ok": True}
+        return {"ok": True} if well_formed else {"ok": False, "error": ERR_BAD_REQUEST}
+
     def _on_release(self, session_id: str) -> Dict[str, Any]:
         """A clean session end: archive the thread, forget the session."""
         self.registry.remove(session_id)
@@ -345,67 +373,63 @@ class Broker:
     ) -> bool:
         """Push a gate resolution into the session's own listener.
 
-        The frame carries ``discord_user_id`` because the APPROVER check
-        happens in the SESSION, not here (§3.2a): the authorization database
-        belongs to the session, and the decision should fall where the gate
-        lives.  Freezing this frame without the sender would leave C4 unable
-        to add it later.
+        Whether it ARRIVED.  Whether the session then ACCEPTED the click is a
+        different question with a different audience -- see
+        :meth:`deliver_click`, which the buttons use.
+
+        The transport lives in :mod:`.broker_gates`; what stays here is the
+        one judgement only the broker can make -- whether a failed delivery
+        means the session is GONE.  A token refusal proves the opposite
+        (somebody answered), so it must never mark the session dead: that
+        would archive a live session's thread (INV-C14, AC-15, AC-85d).
         """
+        return self._push_resolution(session_id, gate_id, decision, discord_user_id)[0]
+
+    def deliver_click(
+        self,
+        session_id: str,
+        gate_id: str,
+        decision: str,
+        discord_user_id: Any,
+    ) -> Optional[str]:
+        """Deliver a BUTTON PRESS and answer the person who pressed it.
+
+        ``None`` means the session took the decision; a string is what the
+        clicker is told.  The distinction from :meth:`deliver_resolution` is
+        the point: a frame can ARRIVE and still resolve nothing -- an
+        outsider's press, or a gate the terminal already answered.  Reporting
+        that as a delivery failure would blame the transport for a refusal the
+        session deliberately made (AC-39, AC-74).
+        """
+        delivered, refusal = self._push_resolution(
+            session_id, gate_id, decision, discord_user_id
+        )
+        if not delivered:
+            return UNDELIVERABLE
+        return refusal
+
+    def _push_resolution(
+        self, session_id: str, gate_id: str, decision: str, discord_user_id: Any
+    ) -> Tuple[bool, Optional[str]]:
+        """One delivery: did it arrive, and what did the session say about it."""
         record = self.registry.get(session_id)
         if record is None or not record.inbound_port:
-            return False
+            return False, None
 
-        frame = {
-            "token": self.token,
-            "method": M_RESOLVE,
-            "session_id": session_id,
-            "params": {
-                "gate_id": gate_id,
-                "decision": decision,
-                "discord_user_id": discord_user_id,
-            },
-        }
+        frame = broker_gates.resolution_frame(
+            self.token, session_id, gate_id, decision, discord_user_id
+        )
+        outcome, answer = broker_gates.push(record.inbound_port, frame)
 
-        for attempt in range(RETRY_ATTEMPTS):
-            outcome = self._send_once(record.inbound_port, frame)
-            if outcome is _DELIVERED:
-                self._unreachable.discard(session_id)
-                return True
-            if outcome is _TRANSPORT_FAILED:
-                # Nobody answered at all -- §3.2a's "session gone" case.
-                self._unreachable.add(session_id)
-                break
-            # Refused: the session is demonstrably ALIVE and simply has a
-            # stale token.  It re-reads the portfile the moment it refuses,
-            # so the next attempt meets the healed one (AC-85d).  Marking it
-            # dead here would archive a live session's thread.
-            if attempt + 1 < RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
-
+        if outcome is broker_gates.DELIVERED:
+            self._unreachable.discard(session_id)
+            refusal = answer.get("refusal") if isinstance(answer, dict) else None
+            return True, str(refusal) if refusal else None
+        if outcome is broker_gates.TRANSPORT_FAILED:
+            # Nobody answered at all -- §3.2a's "session gone" case.
+            self._unreachable.add(session_id)
         self._safely(self._gateway.post, session_id, UNDELIVERABLE)
-        return False
-
-    def _send_once(self, port: int, frame: Dict[str, Any]) -> "_Outcome":
-        payload = (json.dumps(frame) + "\n").encode("utf-8")
-        try:
-            with socket.create_connection(
-                (LOOPBACK, port), timeout=SOCKET_TIMEOUT
-            ) as sock:
-                sock.settimeout(SOCKET_TIMEOUT)
-                sock.sendall(payload)
-                with sock.makefile("rb") as stream:
-                    line = stream.readline(MAX_FRAME_BYTES)
-        except OSError:
-            return _TRANSPORT_FAILED
-        if not line:
-            return _TRANSPORT_FAILED
-        try:
-            answer = json.loads(line.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            # A reply we cannot read still proves somebody answered, so this
-            # is not a transport failure -- but it is not an ack either.
-            return _REFUSED
-        return _DELIVERED if isinstance(answer, dict) and answer.get("ok") else _REFUSED
+        return False, None
 
     def is_marked_dead(self, session_id: str) -> bool:
         """Whether the session's listener could not be reached at all."""
@@ -458,26 +482,6 @@ class Broker:
             logger.debug(
                 "cp_discord: %s failed", getattr(call, "__name__", call), exc_info=True
             )
-
-
-class _Outcome:
-    """Three-valued delivery result; ``bool`` cannot express the middle one."""
-
-    __slots__ = ("name",)
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return f"<{self.name}>"
-
-
-#: Accepted.
-_DELIVERED = _Outcome("delivered")
-#: Answered, but not accepted -- somebody IS there (usually a stale token).
-_REFUSED = _Outcome("refused")
-#: Nobody answered: connect refused, timeout, closed.
-_TRANSPORT_FAILED = _Outcome("transport_failed")
 
 
 def broker_is_reachable(address: Optional[BrokerAddress]) -> bool:
@@ -562,6 +566,9 @@ __all__: Sequence[str] = (
     "ERR_UNKNOWN_SESSION",
     "LOCAL_ONLY_MARKER",
     "MAX_FRAME_BYTES",
+    "GATE_CLOSED",
+    "GATE_OPEN",
+    "M_GATE",
     "M_HEARTBEAT",
     "M_REGISTER",
     "M_RELEASE",
