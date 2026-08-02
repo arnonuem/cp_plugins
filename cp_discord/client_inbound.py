@@ -152,7 +152,15 @@ class InboundListener:
             except (TimeoutError, socket.timeout):
                 continue
             except OSError:
-                return
+                # Closed underneath us (stop) or a transient accept failure.
+                # Ending the loop on a transient one would leave the socket
+                # bound and the port registered while nothing drains it: the
+                # broker keeps delivering, reads a transport failure, and
+                # finally archives the thread of a live session (AC-15).
+                if self._stop.is_set():
+                    return
+                logger.debug("cp_discord: an inbound accept failed", exc_info=True)
+                continue
             try:
                 self._handle_connection(connection)
             except Exception:

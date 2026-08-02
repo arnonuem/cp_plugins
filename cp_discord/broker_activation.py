@@ -86,6 +86,10 @@ class BrokerSupervisor:
             return True
         if not self._lock.acquire():
             return False
+        # Bound BEFORE the try so the except branch can reach a broker that was
+        # already started: every step after ``start()`` can throw, and a local
+        # assigned inside the try would be unbound exactly then.
+        broker: Optional[Broker] = None
         try:
             token = election.adopt_or_mint_token()
             broker = Broker(
@@ -103,7 +107,17 @@ class BrokerSupervisor:
             self.broker = broker
             return True
         except Exception:
-            logger.debug("cp_discord: could not start the broker", exc_info=True)
+            # Louder than the lost ``acquire()`` above: THAT is a normal outcome
+            # (another session serves), while a broker that started and then
+            # fell over is the only path that can strand a listening socket.
+            logger.warning("cp_discord: could not start the broker", exc_info=True)
+            # Stop BEFORE releasing, never after.  Releasing first opens a
+            # window in which a rival wins the lock while this socket is still
+            # answering -- two brokers at once, which SS3.1 holds to be worse
+            # than no broker at all.  ``self.broker`` was never assigned, so
+            # nothing else could ever reach this one again.
+            if broker is not None:
+                broker.stop()
             self._lock.release()
             return False
 

@@ -12,10 +12,13 @@ without a bot token.
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
 import socket
 import threading
 import time
+import types
 
 import pytest
 
@@ -557,6 +560,112 @@ def test_the_listener_can_restart(listener):
 
     assert instance.port > 0
     assert first > 0
+
+
+def test_a_transient_accept_error_does_not_kill_the_return_channel(
+    listener, monkeypatch, caplog
+):
+    """``accept`` fails transiently (ECONNABORTED, EMFILE) -- and must not end us.
+
+    Treating any ``OSError`` as teardown ends the accept loop for the LIFE of
+    the session while the socket stays bound: ``inbound_port`` keeps reporting
+    a valid port, so the broker keeps delivering into a queue nobody drains,
+    reads TRANSPORT_FAILED, marks the session unreachable and finally archives
+    the thread of a session that is alive and working.  Every phone click
+    after that is lost -- the AC-15 damage the PID second signal exists to
+    prevent.  The broker's own loop already gets this right
+    (``broker_server.py:188-192``).
+    """
+    raised = []
+    real_socket = socket.socket
+
+    class FlakyAcceptSocket:
+        """A real loopback socket whose FIRST ``accept`` aborts transiently."""
+
+        def __init__(self, *args, **kwargs):
+            self._sock = real_socket(*args, **kwargs)
+            self._failures_left = 1
+
+        def accept(self):
+            if self._failures_left:
+                self._failures_left -= 1
+                raised.append(True)
+                raise OSError(errno.ECONNABORTED, "software caused connection abort")
+            return self._sock.accept()
+
+        def __getattr__(self, name):
+            return getattr(self._sock, name)
+
+    monkeypatch.setattr(
+        client_inbound,
+        "socket",
+        types.SimpleNamespace(
+            socket=FlakyAcceptSocket,
+            AF_INET=socket.AF_INET,
+            SOCK_STREAM=socket.SOCK_STREAM,
+            timeout=socket.timeout,
+        ),
+    )
+
+    arrived = threading.Event()
+    instance = listener(handler=lambda **kwargs: arrived.set())
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.client_inbound"):
+        instance.start()
+        assert instance.port > 0
+        with socket.create_connection(("127.0.0.1", instance.port), timeout=3) as sock:
+            sock.sendall(
+                (
+                    json.dumps(
+                        {
+                            "token": "good",
+                            "method": broker_server.M_RESOLVE,
+                            "params": {"gate_id": "g1", "decision": "yes"},
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            with sock.makefile("r", encoding="utf-8") as stream:
+                response = json.loads(stream.readline())
+
+    assert raised, "the transient failure never fired; the test proves nothing"
+    assert response["ok"] is True
+    assert arrived.wait(2.0)
+    # Silence is what made this a copy slip rather than a decision: an aborted
+    # accept has to leave a trace, or the next one is invisible too.
+    assert any(
+        record.name == "cp_discord.client_inbound"
+        and record.levelno == logging.DEBUG
+        and record.exc_info is not None
+        for record in caplog.records
+    )
+
+
+def test_a_teardown_accept_error_ends_the_loop_quietly(listener, caplog):
+    """The other half: an ``accept`` aborted by our own ``stop`` is not a fault.
+
+    Driven synchronously because this is a RACE -- ``stop`` closes the socket
+    while ``accept`` is in flight -- and the loop condition alone cannot catch
+    it: the throw happens INSIDE the iteration that already passed the check.
+    Without the ``_stop`` guard every shutdown that loses this race files a
+    traceback for a socket we closed on purpose, and the log stops meaning
+    anything the moment a real transient failure needs to be seen.
+    """
+    instance = listener()
+
+    class ClosedUnderneathUs:
+        def accept(self):
+            instance.stop()  # what really happens: teardown, mid-accept
+            raise OSError(errno.EBADF, "bad file descriptor")
+
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.client_inbound"):
+        instance._serve(ClosedUnderneathUs())
+
+    assert [
+        record
+        for record in caplog.records
+        if record.name == "cp_discord.client_inbound"
+    ] == []
 
 
 def test_a_non_resolve_method_is_refused(listener):

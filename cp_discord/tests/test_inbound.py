@@ -473,7 +473,12 @@ def test_inv_c25_the_session_principal_functions_are_not_used():
     }
 
     assert called.isdisjoint(
-        {"open_gate", "authorize_resolution", "timeout_decision", "bind_session_principal"}
+        {
+            "open_gate",
+            "authorize_resolution",
+            "timeout_decision",
+            "bind_session_principal",
+        }
     )
 
 

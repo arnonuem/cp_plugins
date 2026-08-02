@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import stat
@@ -1491,6 +1492,73 @@ def test_the_holder_re_elects_itself_after_a_thread_death(supervisor_factory):
     assert holder.is_broker is False
     assert holder.try_elect() is True
     assert holder.broker.address.port != port_before
+
+
+def test_a_failed_election_leaves_no_broker_behind(
+    supervisor_factory, bridge_dir, monkeypatch, caplog
+):
+    """A half-finished election must not leave a serving thread nobody owns.
+
+    ``start()`` binds the socket, and every step after it can throw --
+    ``write_portfile`` is a disk write, so a full volume, a permission or (on
+    Windows) a scanner is enough.  Falling out of ``try_elect`` without
+    stopping that broker RELEASES the lock while the thread keeps answering:
+    the next candidate wins, and two brokers serve at once -- the state SS3.1
+    holds to be worse than no broker at all.  And it is unrecoverable, because
+    ``self.broker`` was never assigned: ``_release``, ``check_broker_health``
+    and ``stop`` all read it, so nothing can reach the orphan for the life of
+    the process.
+    """
+    from cp_discord import broker_activation
+
+    built = []
+    order = []
+    real_broker = broker_activation.Broker
+
+    def recording_broker(*args, **kwargs):
+        instance = real_broker(*args, **kwargs)
+        real_stop = instance.stop
+
+        def recording_stop():
+            order.append("stop")
+            real_stop()
+
+        instance.stop = recording_stop
+        built.append(instance)
+        return instance
+
+    def explode(_address):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(broker_activation, "Broker", recording_broker)
+    monkeypatch.setattr(broker_activation.election, "write_portfile", explode)
+
+    supervisor = supervisor_factory()
+    real_release = supervisor._lock.release
+    monkeypatch.setattr(
+        supervisor._lock,
+        "release",
+        lambda: (order.append("release"), real_release())[1],
+    )
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.broker_activation"):
+        assert supervisor.try_elect() is False
+
+    assert supervisor.is_broker is False
+    assert len(built) == 1, "the broker was built and started before the throw"
+    assert built[0].is_alive() is False, "the serving thread outlived its owner"
+    assert broker_activation.broker_is_reachable(built[0].address) is False
+    # Order, not merely presence: releasing first opens the window in which a
+    # rival wins the lock while this socket is still answering.
+    assert order == ["stop", "release"]
+    # Louder than the lost ``acquire()`` one line above, which is a normal
+    # outcome.  This one is not: a broker that started and then fell over is
+    # the only path that can strand a socket.
+    levels = [
+        record.levelno
+        for record in caplog.records
+        if record.name == "cp_discord.broker_activation"
+    ]
+    assert levels == [logging.WARNING]
 
 
 def test_a_stale_portfile_does_not_block_the_election(
