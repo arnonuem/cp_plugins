@@ -217,9 +217,21 @@ def connect_gateway(config: Any, gateway: broker_threads.DiscordGateway) -> None
 
     import discord
 
+    # NO ``message_content``.  It is a PRIVILEGED intent, and the only handler
+    # registered below is ``on_ready`` -- the bot would collect the full text
+    # of every message in the guild and never read a byte of it.  Turn it back
+    # on together with the ``on_message`` handler of §6.0 (follow-up
+    # ``followups/20260802_chat_zustellweg_discord_zu_sitzung.md``), not before:
+    # without the intent that handler receives empty ``message.content``.
     intents = discord.Intents.default()
-    intents.message_content = True
-    client = discord.Client(intents=intents)
+
+    # Suppression belongs to the CONNECTION, not to each call site.  py-cord
+    # folds this into every outgoing message (``discord/abc.py:1623-1630``), so
+    # a send that passes nothing still cannot ping -- reports quote agent
+    # output verbatim, and a new send path must not be able to forget this.
+    client = discord.Client(
+        intents=intents, allowed_mentions=discord.AllowedMentions.none()
+    )
 
     @client.event
     async def on_ready() -> None:  # pragma: no cover - needs a live bot
