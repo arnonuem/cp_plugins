@@ -253,12 +253,22 @@ def test_the_deny_button_carries_the_other_decision(broker, gateway, session, ch
 
 
 def test_a_gate_post_pings_nobody(broker, gateway, session, channel):
-    """A gate quotes the command verbatim; an ``@everyone`` in it must not fire."""
+    """A gate quotes the command verbatim; an ``@everyone`` in it must not fire.
+
+    Asserted on the WIRE form, not on ``is not None``: the connection-wide
+    default (``broker_activation.py:233``) does NOT cover this send, because
+    py-cord merges the per-send value over the connection's and the explicit
+    one wins (measured: ``none().merge(all())`` ->
+    ``{'parse': ['everyone', 'users', 'roles']}``).  ``broker_threads.py:216``
+    passes exactly such an explicit value, so only ``{'parse': []}`` proves
+    the suppression -- ``AllowedMentions()`` is not ``None`` either, and it
+    permits ``@everyone``.
+    """
     instance = registered(session, gateway)
     instance.submit_gate("g1", "Shell Command", "echo @everyone")
     gateway.wait_idle()
 
-    assert posted_gate(channel).allowed_mentions is not None
+    assert posted_gate(channel).allowed_mentions.to_dict() == {"parse": []}
 
 
 # --------------------------------------------------------------------------- #

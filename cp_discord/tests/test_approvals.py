@@ -28,6 +28,13 @@ APPROVER_ID = "4242"
 STRANGER_ID = "9999"
 TALKER_ONLY_ID = "7777"
 
+#: The REAL setter, grabbed at import time -- the autouse ``clean_state``
+#: fixture replaces ``approvals._set_core_flag`` with a recorder for every
+#: other test, so by the time a test body runs the genuine article is gone.
+#: AC-87d needs it because what it guards (``notify=True``) lives INSIDE that
+#: function, where no recorder on the seam can observe it.
+REAL_SET_CORE_FLAG = approvals._set_core_flag
+
 
 # --------------------------------------------------------------------------- #
 # Harness
@@ -866,6 +873,36 @@ def test_ac87c_the_flag_is_never_set_under_the_state_lock(clean_state):
         approvals._set_core_flag = lambda value: clean_state.append(("flag", value))
 
     assert seen == [False, False]
+
+
+def test_ac87d_the_core_setter_always_asks_for_a_notification(monkeypatch):
+    """AC-87c's other half: not just WHERE the setter runs, but WITH WHAT.
+
+    The REAL ``_set_core_flag`` is exercised here, not the seam.  Every other
+    test in this file replaces it (``clean_state``), and the value at stake --
+    ``notify=True`` at ``approvals.py:172`` -- lives INSIDE it, so a recorder
+    on the seam can never see it: the sole call site (``approvals.py:457``)
+    passes ``value`` positionally and no kwargs at all.
+
+    What ``notify=False`` would cost: it CLEARS ``_AWAITING_USER_INPUT_NOTIFY``
+    process-wide (``command_runner.py:326-329``), and ``reporter.py:506-508``
+    reads exactly that flag -- so every later gate would go silent on the
+    phone while the terminal still looked normal.  Both edges are asserted,
+    because our gates are agent-initiated in both directions.
+    """
+    from code_puppy.tools import command_runner
+
+    calls = []
+    monkeypatch.setattr(
+        command_runner,
+        "set_awaiting_user_input",
+        lambda awaiting, **kwargs: calls.append((awaiting, kwargs)),
+    )
+
+    REAL_SET_CORE_FLAG(True)
+    REAL_SET_CORE_FLAG(False)
+
+    assert calls == [(True, {"notify": True}), (False, {"notify": True})]
 
 
 # --------------------------------------------------------------------------- #
