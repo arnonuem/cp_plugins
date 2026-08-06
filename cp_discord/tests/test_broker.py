@@ -484,6 +484,48 @@ def test_a_discord_failure_never_escapes(manager, channel):
     run(manager.post("cp_discord:a", "anything"))
 
 
+def test_a_refused_thread_creation_says_why(manager, channel, caplog):
+    """A bridge that fails SILENTLY is indistinguishable from one that works.
+
+    ``debug`` is not enough: nobody runs a terminal at debug level, so the
+    only symptom left was "no thread appears", with no route back to the
+    cause -- which is exactly how a live outage cost 40 minutes of bisecting.
+    """
+
+    async def refuse(**_kwargs):
+        raise RuntimeError("discord is down")
+
+    channel.create_thread = refuse
+
+    with caplog.at_level(logging.WARNING, logger="cp_discord.broker_threads"):
+        assert run(manager.ensure_thread("cp_discord:a", "cp_plugins/main")) is None
+
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "cp_discord:a" in record.getMessage()
+    ], "a thread that could not be created must be audible, with its session"
+
+
+def test_a_missing_channel_says_why(caplog):
+    """The state the live bridge was actually stuck in: no channel, no word.
+
+    Reached while the bot is still logging in -- or forever, if the token or
+    the channel id is wrong.  Both are faults an operator can fix, but only
+    if somebody tells them.
+    """
+    manager = threads.ThreadManager(lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="cp_discord.broker_threads"):
+        assert run(manager.ensure_thread("cp_discord:a", "cp_plugins/main")) is None
+
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "cp_discord:a" in record.getMessage()
+    ], "a session with no channel to open a thread in must be audible"
+
+
 def test_channel_posts_go_to_the_channel(manager, channel):
     """AC-60b/AC-71b: activation warnings belong in the channel itself.
 
@@ -543,6 +585,76 @@ def test_registry_survives_a_broker_change(bridge_dir):
     assert restored.inbound_port == 6001
     assert restored.thread_id == 4242
     assert restored.title == "cp_plugins/main"
+
+
+def test_the_registry_records_a_thread_id(bridge_dir):
+    """The write-back the whole adoption path depends on (INV-C14, AC-54).
+
+    ``adopt_registered_sessions`` has nothing to adopt unless the id the
+    gateway created actually lands here -- and it has to land ON DISK, since
+    the case adoption exists for is a broker that already died.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record(thread_id=None))
+
+    assert registry.set_thread_id("cp_discord:a", 4242) is True
+    assert registry.get("cp_discord:a").thread_id == 4242
+    assert threads.SessionRegistry().get("cp_discord:a").thread_id == 4242
+
+
+def test_a_session_without_a_thread_may_claim_one(bridge_dir):
+    """Befund B: "known" is not "served" -- but only ONE ask goes out per gap.
+
+    Both halves matter.  Without the first, a registration that survived a
+    Discord outage leaves the session threadless for good; without the second,
+    the re-registrations of an election would each open one.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record(thread_id=None))
+
+    assert registry.claim_thread("cp_discord:a") is True
+    assert registry.claim_thread("cp_discord:a") is False, "claimed twice"
+
+
+def test_a_session_with_a_thread_claims_nothing(bridge_dir):
+    """INV-C14: the history has to survive the re-registration after an election."""
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record(thread_id=4242))
+
+    assert registry.claim_thread("cp_discord:a") is False
+
+
+def test_a_claim_is_dropped_with_the_session(bridge_dir):
+    """A session that comes back after AC-13 needs a thread again.
+
+    Its old one was archived, so a claim left behind would keep the returning
+    session mute -- the same permanent silence, through the other door.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record(thread_id=None))
+    registry.claim_thread("cp_discord:a")
+
+    registry.remove("cp_discord:a")
+    registry.upsert(a_record(thread_id=None))
+
+    assert registry.claim_thread("cp_discord:a") is True
+
+
+def test_an_unknown_session_claims_nothing(bridge_dir):
+    """Registering is what creates the right to a thread, as it does for ``seq``."""
+    assert threads.SessionRegistry().claim_thread("cp_discord:ghost") is False
+
+
+def test_recording_a_thread_id_for_a_gone_session_is_quiet(bridge_dir):
+    """The session may have been released while Discord was still working.
+
+    Re-inserting it here would resurrect a record that ``release`` deliberately
+    removed, and the next sweep would then archive a thread nobody owns.
+    """
+    registry = threads.SessionRegistry()
+
+    assert registry.set_thread_id("cp_discord:gone", 4242) is False
+    assert registry.get("cp_discord:gone") is None
 
 
 @POSIX_ONLY
@@ -901,6 +1013,160 @@ def test_the_inbound_port_is_recorded(broker):
     register(broker, inbound_port=6123)
 
     assert broker.registry.get("cp_discord:a").inbound_port == 6123
+
+
+def test_a_known_session_without_a_thread_still_gets_one(broker, gateway):
+    """ "Known" is not "has a thread", and confusing them strands a session.
+
+    A registration that got through while Discord was unreachable leaves an
+    entry with an empty ``thread_id``.  Reading that entry as "already served"
+    makes the session permanently invisible, and a restart does NOT heal it --
+    the entry is precisely what survives one.  Every Discord outage during
+    thread creation would otherwise leave a session behind for good.
+    """
+    broker.registry.upsert(a_record(thread_id=None))
+
+    assert register(broker)["ok"] is True
+    assert gateway.opened == [("cp_discord:a", "cp_plugins/main")]
+
+
+def test_a_session_that_has_a_thread_gets_no_second_one(broker, gateway):
+    """INV-C14, the other half: re-registering must not shred the history.
+
+    Every session calls in again after an election, so rebuilding there would
+    destroy exactly the history this feature exists to keep.  This is the
+    guard on the fix above, not a restatement of it.
+    """
+    broker.registry.upsert(a_record(thread_id=4242))
+
+    assert register(broker)["ok"] is True
+    assert gateway.opened == []
+
+
+def test_a_released_session_that_comes_back_gets_a_new_thread(broker, gateway):
+    """AC-13 then a fresh start: its old thread was ARCHIVED, so it needs one.
+
+    The broker remembers that it already asked for a thread, which is what
+    keeps a re-registration from opening a second one.  Carrying that memory
+    past the archive would leave the returning session mute for good -- the
+    same permanent silence, entered through the other door.
+    """
+    register(broker)
+    call(
+        broker,
+        {
+            "token": broker.token,
+            "method": "release",
+            "session_id": "cp_discord:a",
+            "seq": 9,
+            "params": {},
+        },
+    )
+    gateway.opened.clear()
+
+    assert register(broker)["ok"] is True
+    assert gateway.opened == [("cp_discord:a", "cp_plugins/main")]
+
+
+def test_a_swept_session_that_comes_back_gets_a_new_thread(broker, gateway):
+    """The same door, opened by the sweep instead of by a clean release (§7)."""
+    register(broker)
+    broker.registry.touch("cp_discord:a", now=0.0)
+    broker.registry.upsert(
+        a_record(pid=_unused_pid(), started_at=1.0, last_seen=0.0, thread_id=None)
+    )
+    broker.sweep_dead_sessions()
+    gateway.opened.clear()
+
+    assert register(broker)["ok"] is True
+    assert gateway.opened == [("cp_discord:a", "cp_plugins/main")]
+
+
+def test_a_lost_write_back_heals_without_a_second_thread(bridge_dir, channel):
+    """A thread that exists while its record says ``None`` -- and the repair.
+
+    The write-back is asynchronous, so the register can lag what Discord
+    already holds.  Asking again must NOT produce a second thread (INV-C14):
+    ``ensure_thread`` hands back the one that exists, which is also what puts
+    the missing id back into the record.  Driven through the real gateway,
+    because the idempotence under test is the gateway's.
+    """
+    from cp_discord import broker_server
+
+    gateway = threads.DiscordGateway()
+    gateway.start_loop()
+    gateway.set_channel(channel)
+    instance = broker_server.Broker(gateway, token="s3cret")
+    instance.start()
+    try:
+        register(instance)
+        gateway.wait_idle()
+        # Exactly the damaged state: the thread is real, the record forgot it.
+        instance.registry.remove("cp_discord:a")
+        instance.registry.upsert(a_record(thread_id=None))
+
+        assert register(instance)["ok"] is True
+        gateway.wait_idle()
+    finally:
+        instance.stop()
+        gateway.close()
+
+    assert len(channel.threads) == 1, "a second thread was opened"
+    assert instance.registry.get("cp_discord:a").thread_id == channel.threads[0].id
+
+
+def test_the_created_thread_id_reaches_the_registry(bridge_dir, channel):
+    """Befund A: the id ``ensure_thread`` returns has to be WRITTEN DOWN.
+
+    Without it the column stays ``None`` forever, and
+    ``adopt_registered_sessions`` finds nothing to adopt after a re-election --
+    INV-C14 would hold in the suite and nowhere else.  Driven through the real
+    gateway on purpose: the write-back crosses the queue, and a double would
+    prove only that the double works.
+    """
+    from cp_discord import broker_server
+
+    gateway = threads.DiscordGateway()
+    gateway.start_loop()
+    gateway.set_channel(channel)
+    instance = broker_server.Broker(gateway, token="s3cret")
+    instance.start()
+    try:
+        assert register(instance)["ok"] is True
+        gateway.wait_idle()
+    finally:
+        instance.stop()
+        gateway.close()
+
+    assert len(channel.threads) == 1
+    assert instance.registry.get("cp_discord:a").thread_id == channel.threads[0].id
+
+
+def test_a_recorded_thread_id_survives_into_the_next_broker(bridge_dir, channel):
+    """AC-53/AC-54 end to end: what the write-back is FOR.
+
+    The successor loads the register from disk and adopts the thread instead
+    of building a new one -- the tab switch the user never sees.
+    """
+    from cp_discord import broker_server
+
+    gateway = threads.DiscordGateway()
+    gateway.start_loop()
+    gateway.set_channel(channel)
+    first = broker_server.Broker(gateway, token="s3cret")
+    first.start()
+    try:
+        register(first)
+        gateway.wait_idle()
+    finally:
+        first.stop()
+
+    successor = RecordingGateway()
+    second = broker_server.Broker(successor, token="s3cret")
+    second.adopt_registered_sessions()
+    gateway.close()
+
+    assert successor.adopted == ["cp_discord:a"]
 
 
 # --------------------------------------------------------------------------- #

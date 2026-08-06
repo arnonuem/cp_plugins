@@ -106,6 +106,12 @@ class Broker:
         self._notices = tuple(notices)
         self._notices_announced = False
         self.registry = broker_threads.SessionRegistry()
+        # The gateway learns a thread's id when it CREATES one; the registry is
+        # all that still knows it once this broker is gone.  A callable, not
+        # the register itself, so the dependency keeps pointing one way.
+        recorder = getattr(gateway, "set_thread_recorder", None)
+        if recorder is not None:
+            self._safely(recorder, self.registry.set_thread_id)  # INV-C14
         self._server: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -279,6 +285,10 @@ class Broker:
         Re-registration is normal (a re-election makes every session call in
         again) and must NOT rebuild the thread -- INV-C14: the history has to
         survive a tab switch.
+
+        The question asked is "does it HAVE a thread?", never "is it new?" --
+        identical until a registration gets through while Discord does not
+        (see :meth:`SessionRegistry.claim_thread`).
         """
         pid = params.get("pid")
         if not isinstance(pid, int) or isinstance(pid, bool):
@@ -298,7 +308,9 @@ class Broker:
         )
         self.registry.upsert(record)
         self._unreachable.discard(session_id)
-        if known is None:
+        # A claim is a REQUEST: if the thread exists and only the record lost
+        # it, the gateway hands back that one rather than opening a second.
+        if self.registry.claim_thread(session_id):
             self._safely(self._gateway.open_thread, session_id, record.title)
         return {"ok": True, "session_id": session_id}
 
@@ -415,12 +427,10 @@ class Broker:
         record = self.registry.get(session_id)
         if record is None or not record.inbound_port:
             return False, None
-
         frame = broker_gates.resolution_frame(
             self.token, session_id, gate_id, decision, discord_user_id
         )
         outcome, answer = broker_gates.push(record.inbound_port, frame)
-
         if outcome is broker_gates.DELIVERED:
             self._unreachable.discard(session_id)
             refusal = answer.get("refusal") if isinstance(answer, dict) else None

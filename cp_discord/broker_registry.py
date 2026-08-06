@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from . import broker_election as election
 
@@ -134,6 +134,11 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._records: Dict[str, SessionRecord] = {}
+        # Sessions a thread has already been requested for.  NOT persisted and
+        # not part of a record: it covers the window before the id is written
+        # back, and a fresh broker must stay free to ask again for a record
+        # that never got one (see :meth:`claim_thread`).
+        self._claimed: Set[str] = set()
         self._load()
 
     # -- reading --------------------------------------------------------
@@ -155,9 +160,62 @@ class SessionRegistry:
 
     def remove(self, session_id: str) -> None:
         with self._lock:
+            # The claim goes with the record: removal means the thread is being
+            # archived, so a session that comes back needs a NEW one, and a
+            # claim left behind would keep it silent for the rest of its life.
+            self._claimed.discard(session_id)
             if self._records.pop(session_id, None) is None:
                 return
             self._save_locked()
+
+    def set_thread_id(self, session_id: str, thread_id: int) -> bool:
+        """Record the Discord thread that now belongs to *session_id*.
+
+        Whether it landed.  An unknown session is REFUSED rather than created:
+        the id arrives asynchronously, so it can turn up after a ``release``
+        removed the record, and re-inserting it would resurrect a session the
+        next sweep would archive a thread for.
+
+        Without this the column stays empty forever and
+        ``adopt_registered_sessions`` finds nothing to adopt -- INV-C14 would
+        hold in the suite and nowhere else.
+        """
+        with self._lock:
+            record = self._records.get(session_id)
+            if record is None or record.thread_id == thread_id:
+                return False
+            self._records[session_id] = replace(record, thread_id=thread_id)
+            self._save_locked()
+            return True
+
+    def claim_thread(self, session_id: str) -> bool:
+        """Whether a Discord thread still has to be opened for this session.
+
+        The question is "does it HAVE one?", never "is it new?".  The two look
+        identical until a registration gets through while Discord does not:
+        the record then exists with an empty ``thread_id``, "new?" answers no,
+        and the session stays threadless for as long as it lives -- a restart
+        does not heal it, because the record is precisely what survives one.
+
+        Answers ``True`` at most ONCE per gap, so that the re-registrations of
+        an election do not each open a thread.  The claim is deliberately
+        in-memory: it exists to cover the window before the id is written
+        back, and dropping it with the broker is what lets a record that never
+        got a thread be retried at the next election rather than trusted
+        forever.
+
+        A ``True`` here is a REQUEST, not a promise that nothing exists: the
+        Discord side has the last word and hands back the thread it already
+        holds instead of creating a second one (INV-C14).
+        """
+        with self._lock:
+            record = self._records.get(session_id)
+            if record is None or record.thread_id is not None:
+                return False
+            if session_id in self._claimed:
+                return False
+            self._claimed.add(session_id)
+            return True
 
     def touch(self, session_id: str, *, now: Optional[float] = None) -> None:
         """Record a heartbeat."""
