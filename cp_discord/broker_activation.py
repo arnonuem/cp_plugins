@@ -224,6 +224,20 @@ def connect_gateway(config: Any, gateway: broker_threads.DiscordGateway) -> None
     holds queued work rather than dropping it -- a session may well register
     before the bot has finished logging in.
 
+    **The client is BUILT on that thread, not merely started there.**
+    ``discord.Client.__init__`` pins ``self.loop`` at construction time
+    (``discord/client.py:253`` -> ``_get_event_loop()``), and ``run()`` later
+    drives exactly that object (``:852``).  This function is called from
+    ``on_startup``, which the core awaits inside its OWN running loop, so
+    constructing here handed the worker the MAIN loop: ``run()`` then tried to
+    ``run_forever()`` a loop that was already running and, while cleaning up,
+    to ``close()`` it.  Discord stayed dark for the whole session.
+
+    Measured against py-cord 2.8.1: built inside a running loop the client
+    adopts that loop; built on a thread that first calls ``set_event_loop`` it
+    adopts the thread's own; built on a thread with no loop at all it raises.
+    The ``set_event_loop`` below is therefore load-bearing.
+
     Failure is logged, never raised (INV-C1).
     """
     import asyncio
@@ -243,30 +257,42 @@ def connect_gateway(config: Any, gateway: broker_threads.DiscordGateway) -> None
     # folds this into every outgoing message (``discord/abc.py:1623-1630``), so
     # a send that passes nothing still cannot ping -- reports quote agent
     # output verbatim, and a new send path must not be able to forget this.
-    client = discord.Client(
-        intents=intents, allowed_mentions=discord.AllowedMentions.none()
-    )
-
-    @client.event
-    async def on_ready() -> None:  # pragma: no cover - needs a live bot
-        gateway.attach_loop(asyncio.get_running_loop())
-        gateway.set_thread_resolver(client.get_channel)
-        channel = client.get_channel(config.channel_id)
-        if channel is None:
-            try:
-                channel = await client.fetch_channel(config.channel_id)
-            except Exception:
-                logger.warning(
-                    "cp_discord: channel %s is not reachable", config.channel_id
-                )
-                return
-        gateway.set_channel(channel)
-
     def run() -> None:  # pragma: no cover - needs a live bot
+        # Give this thread its own loop BEFORE building the client, so the
+        # client pins ours instead of the core's (see the docstring).
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
         try:
+            client = discord.Client(
+                intents=intents, allowed_mentions=discord.AllowedMentions.none()
+            )
+
+            @client.event
+            async def on_ready() -> None:
+                gateway.attach_loop(asyncio.get_running_loop())
+                gateway.set_thread_resolver(client.get_channel)
+                channel = client.get_channel(config.channel_id)
+                if channel is None:
+                    try:
+                        channel = await client.fetch_channel(config.channel_id)
+                    except Exception:
+                        logger.warning(
+                            "cp_discord: channel %s is not reachable",
+                            config.channel_id,
+                        )
+                        return
+                gateway.set_channel(channel)
+
             client.run(config.token)
         except Exception:
-            logger.warning("cp_discord: the Discord connection ended", exc_info=True)
+            # A rejected token surfaces here as LoginFailure -- the single most
+            # likely reason the bridge stays dark, so it is named rather than
+            # buried in a generic "connection ended".
+            logger.warning(
+                "cp_discord: the Discord connection ended -- the bridge stays "
+                "offline for this session (check DISCORD_BOT_TOKEN)",
+                exc_info=True,
+            )
 
     threading.Thread(target=run, name="cp_discord-discord", daemon=True).start()
 

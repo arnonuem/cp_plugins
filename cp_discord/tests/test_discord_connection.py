@@ -43,9 +43,23 @@ class _RecordingClient:
     """Stands in for ``discord.Client`` and remembers how it was built."""
 
     last: dict = {}
+    #: The loop that was current on the thread AT CONSTRUCTION TIME.  This is
+    #: the whole point of the R18 regression test: the real client pins
+    #: ``self.loop`` here (``discord/client.py:253``), so recording it is the
+    #: only way to prove it did not adopt the core's loop.
+    built_loop: object = None
+    built_thread: object = None
 
     def __init__(self, **kwargs):
+        import asyncio
+        import threading
+
         type(self).last = dict(kwargs)
+        type(self).built_thread = threading.current_thread().name
+        try:
+            type(self).built_loop = asyncio.get_event_loop()
+        except RuntimeError as exc:  # no loop on this thread at all
+            type(self).built_loop = exc
         self.events = []
 
     def event(self, coro):
@@ -64,20 +78,41 @@ class _RecordingClient:
         return None
 
 
-@pytest.fixture
-def built(monkeypatch):
-    """Run ``connect_gateway`` against a recorder and hand back the client."""
+def _connect(monkeypatch):
+    """Run ``connect_gateway`` against the recorder and WAIT for its thread.
+
+    The wait is not politeness: since R18 the client is constructed ON the
+    worker thread, so returning before it has run would read an empty
+    recorder and every assertion below would pass vacuously.
+    """
+    import threading
+
     import discord
 
     monkeypatch.setattr(discord, "Client", _RecordingClient)
     _RecordingClient.last = {}
+    _RecordingClient.built_loop = None
+    _RecordingClient.built_thread = None
+
+    before = {t.name for t in threading.enumerate()}
 
     gateway = broker_threads.DiscordGateway()
     try:
         broker_activation.connect_gateway(_Config(), gateway)
+        for t in threading.enumerate():
+            if t.name not in before and t.name.startswith("cp_discord-discord"):
+                t.join(5.0)
     finally:
         gateway.close()
+
+    assert _RecordingClient.last, "the client was never constructed"
     return _RecordingClient.last
+
+
+@pytest.fixture
+def built(monkeypatch):
+    """Run ``connect_gateway`` against a recorder and hand back the client."""
+    return _connect(monkeypatch)
 
 
 # --------------------------------------------------------------------------- #
@@ -176,3 +211,53 @@ def test_no_on_message_handler_exists():
 
     assert "async def on_ready" in source
     assert "async def on_message" not in source
+
+
+# --------------------------------------------------------------------------- #
+# R18 -- the client must NOT adopt the core's event loop
+# --------------------------------------------------------------------------- #
+
+
+def test_the_client_is_built_on_its_own_thread_not_the_callers(monkeypatch):
+    """The client must never pin the loop that ``on_startup`` runs in.
+
+    Found in a LIVE test, invisible to every unit test before it.  The core
+    awaits ``on_startup`` inside its OWN running loop; building the client
+    there handed it that loop (``discord/client.py:253`` pins ``self.loop``
+    at construction time) and ``run()`` then tried to ``run_forever()`` a loop
+    that was already running -- and to ``close()`` it while cleaning up.
+    Discord stayed dark for the entire session.
+
+    INV-C1 held throughout: the traceback was caught and the terminal was
+    fine.  That is precisely why this needs its own assertion -- the failure
+    is silent by design.
+    """
+    import threading
+
+    _connect(monkeypatch)
+
+    assert _RecordingClient.built_thread is not None
+    assert _RecordingClient.built_thread != threading.current_thread().name, (
+        "the client was constructed on the caller's thread; it pins the core's "
+        "event loop and run() fails with 'This event loop is already running'"
+    )
+    assert _RecordingClient.built_thread.startswith("cp_discord-discord")
+
+
+def test_the_worker_thread_has_an_event_loop_of_its_own(monkeypatch):
+    """``set_event_loop`` in the worker is load-bearing, not decoration.
+
+    Measured against py-cord 2.8.1: ``discord.Client()`` on a bare thread
+    raises ``RuntimeError: There is no current event loop``.  Asserting this
+    separately stops a future cleanup from dropping the line as redundant.
+    """
+    import asyncio
+
+    _connect(monkeypatch)
+
+    loop = _RecordingClient.built_loop
+    assert not isinstance(loop, RuntimeError), (
+        "the worker thread had no event loop -- discord.Client cannot be built "
+        "there; set_event_loop is missing"
+    )
+    assert isinstance(loop, asyncio.AbstractEventLoop)
