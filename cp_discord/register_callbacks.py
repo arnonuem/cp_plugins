@@ -67,6 +67,14 @@ CHANNEL_ID_CONFIG_KEY = "cp_discord_channel_id"
 MODE_ENV_VAR = "CP_DISCORD_MODE"
 MODE_CONFIG_KEY = "cp_discord_mode"
 
+#: Whether a new thread pulls the approvers in.  Unlike every other switch
+#: here the default is ON, because OFF is the state in which the bridge posts
+#: an approval gate that reaches nobody's phone -- see :mod:`.broker_autojoin`.
+#: Worth switching off only when many parallel sessions make the
+#: notifications more noise than signal.
+AUTOJOIN_ENV_VAR = "CP_DISCORD_AUTOJOIN"
+AUTOJOIN_CONFIG_KEY = "cp_discord_autojoin"
+
 #: Who may talk to the bot, and who may release its approval gates.  Two
 #: INDEPENDENT lists — ``approvers`` is never derived from ``allow_from``.
 ALLOW_FROM_ENV_VAR = "DISCORD_ALLOW_FROM"
@@ -243,6 +251,18 @@ def is_enabled() -> bool:
     access.  A plugin that is merely installed must not make the CLI slower.
     """
     return (_setting(ENABLED_ENV_VAR, ENABLED_CONFIG_KEY) or "").lower() in _TRUTHY
+
+
+def autojoin_enabled() -> bool:
+    """Whether a new thread pulls the approvers in (SPEC §8a).  Default ON.
+
+    Inverted relative to :func:`is_enabled` on purpose: the whole bridge
+    defaults to off because a merely installed plugin must cost nothing, but
+    once it IS on, a thread nobody is notified about defeats the point.  So
+    "not configured" means on, and only an explicit falsy value turns it off.
+    """
+    raw = _setting(AUTOJOIN_ENV_VAR, AUTOJOIN_CONFIG_KEY)
+    return True if raw is None else raw.lower() in _TRUTHY
 
 
 def _read_mode(warn: Callable[[str], None]) -> str:
@@ -532,6 +552,7 @@ __all__: Sequence[str] = (
     "Component",
     "activation_config",
     "activation_warnings",
+    "autojoin_enabled",
     "handle_cli_args",
     "is_enabled",
     "load_pycord",

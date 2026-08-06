@@ -6,6 +6,8 @@ you watch a session from your phone and answer its approval gates.
 Split by layer: ``register_callbacks`` (lifecycle + configuration),
 ``bindings``/``authz`` (identity), ``reporter`` (session state),
 ``collector`` (the report), ``approvals``/``approvals_ui`` (gates),
+``broker_autojoin`` (pulling the approvers into a new thread, so it reaches
+their phone),
 ``chunking``/``rendering`` (message shaping) and ``constants``/``session_ids``
 (the values and formats every layer has to agree on).
 """

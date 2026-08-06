@@ -25,6 +25,7 @@ import threading
 import time
 from typing import Any, Callable, Optional, Sequence, Tuple
 
+from . import broker_autojoin
 from . import broker_election as election
 from . import broker_threads
 from .broker_server import (
@@ -319,6 +320,11 @@ def install(config: Any) -> None:
     if _supervisor is not None:
         uninstall()
 
+    # "Warn once per session" is scoped to the bridge that is RUNNING, and a
+    # fresh install IS a fresh session -- an operator who restarted to check
+    # whether their permission fix took hold is owed the answer again.
+    broker_autojoin.reset_state()
+
     gateway = broker_threads.DiscordGateway()
     supervisor = BrokerSupervisor(lambda: gateway, notices=activation_notices())
     _gateway = gateway
@@ -352,6 +358,7 @@ def uninstall() -> None:
             gateway.close()
         except Exception:
             logger.debug("cp_discord: closing the gateway failed", exc_info=True)
+    broker_autojoin.reset_state()
 
 
 __all__: Sequence[str] = (

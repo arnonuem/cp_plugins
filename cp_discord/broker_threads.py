@@ -21,6 +21,12 @@ threads over.  Creating fresh ones instead would make the history fall apart
 at every tab switch -- and archiving what looked orphaned would take out live
 sessions.
 
+**A new thread pulls its approvers in** (:mod:`.broker_autojoin`).  Discord
+puts a thread in the sidebar, and notifies about it, only for members who
+have JOINED -- so a thread the bot alone is in reaches nobody's phone, which
+is the one thing this bridge exists to do.  Adding happens on CREATION only;
+adoption stays silent.
+
 **Discord archives on its own, so activity revives** (§3.3a, AC-56).  The
 shortest ``auto_archive_duration`` Discord offers is 60 minutes, which is
 exactly the situation this feature is FOR: a session nobody is sitting at.  So
@@ -51,7 +57,7 @@ from typing import (
 #: C1 layer: :mod:`.broker_server` and the suites reach the registry and the
 #: naming rules through this module, and each split is a file boundary, not an
 #: API change.
-from . import approvals_ui
+from . import approvals_ui, broker_autojoin
 from .broker_gates import GateBoard, PostedGate, ViewFactory
 from .broker_naming import (  # noqa: F401
     derive_title,
@@ -174,6 +180,10 @@ class ThreadManager:
 
         self._threads[session_id] = thread
         self._titles[session_id] = unique
+        # Only on a FRESHLY created thread, never on an adopted one: a
+        # re-election has to stay invisible (AC-53), and re-adding everybody
+        # at every tab switch would be a notification per election.
+        await broker_autojoin.add_approvers(thread, session_id)
         return getattr(thread, "id", None)
 
     async def archive(self, session_id: str) -> None:
