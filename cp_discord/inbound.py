@@ -40,9 +40,15 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from . import authz, constants
+from .constants import (
+    STEER_DELIVERED,
+    STEER_EMPTY,
+    STEER_REFUSED,
+    STEER_UNDELIVERED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +282,53 @@ def handle_message(external_id: Any, text: Any) -> Delivery:
     return _router.handle_message(external_id, text)
 
 
+def steer_message(external_id: Any, text: Any) -> Dict[str, Any]:
+    """The PUBLIC door of C5: route a message and report it across the wire.
+
+    :func:`handle_message` keeps its signature and its :class:`Delivery`
+    unchanged (§4.7); this is a translation next to it, not a replacement.
+
+    **Why a plain ``dict`` and not the ``Delivery``:** the caller is C2's
+    listener, and handing it a ``Delivery`` would make :mod:`.client_inbound`
+    import from here -- reversing the direction this module states in its own
+    docstring (*the listening socket is NOT here; C2 owns it*).  A ``dict``
+    crosses the boundary without turning it around.
+
+    **What is deliberately NOT in it:** the principal, and the authorization
+    reason.  Four coarse words, and no way to tell from outside whether a
+    refused sender is unknown or merely not allowed to talk -- the answer
+    travels to the broker, the broker reacts, and a reaction is a
+    confirmation that the session exists (INV-6).
+
+    ``message_id`` is not a parameter: the deduplication window sits one layer
+    up, in ``dispatch``, and enters an id only AFTER this call returns
+    (§4.4a).  A third parameter would be unreadable by construction.
+    """
+    delivery = handle_message(external_id, text)
+    return {
+        "accepted": delivery.accepted,
+        "steer": _steer_of(delivery),
+        "mode": delivery.mode,
+    }
+
+
+def _steer_of(delivery: Delivery) -> str:
+    """The one coarse word for a delivery (§4.3a).
+
+    ``reason`` is READ but never forwarded: it separates "nothing arrived"
+    from "the queue would not take it", which the sender can act on, from
+    "you may not", which they may not learn.  Everything that is not one of
+    the two harmless reasons collapses into ``refused``.
+    """
+    if delivery.accepted:
+        return STEER_DELIVERED
+    if delivery.reason == REASON_EMPTY:
+        return STEER_EMPTY
+    if delivery.reason == REASON_UNDELIVERED:
+        return STEER_UNDELIVERED
+    return STEER_REFUSED
+
+
 def is_installed() -> bool:
     return _installed
 
@@ -330,6 +383,7 @@ def install(config: Any = None) -> None:
     reset_state()
     for phase, handler in _HOOKS:
         register_callback(phase, globals()[handler])
+    _wire_steer_handler(steer_message)
     _installed = True
     logger.debug("cp_discord: C5 return channel installed")
 
@@ -345,8 +399,41 @@ def uninstall() -> None:
             unregister_callback(phase, globals()[handler])
         except Exception:
             logger.debug("cp_discord: unregistering %s failed", phase, exc_info=True)
+    # Teardown walks the layers backwards and C5 goes FIRST
+    # (``register_callbacks.py:114-118``), so C2 is still up right now.  A
+    # handler left on its listener would keep taking steers and push them into
+    # a router that has already been reset.
+    _wire_steer_handler(None)
     _installed = False
     reset_state()
+
+
+def _wire_steer_handler(handler: Any) -> None:
+    """Point C2's listener at :func:`steer_message`, or at nothing.
+
+    C5 registers ITSELF rather than being registered by C2, because the other
+    direction -- ``client.py`` importing this module -- would invert the
+    dependency this file's docstring pins down.  C2 starts second and C5
+    sixth (``register_callbacks.py:120-126``), so by now the listener is
+    there.
+
+    ``active_client()`` is ``Optional`` (``client.py:488``): with no C2 the
+    registration is skipped and C5 still counts as installed, since none of
+    its other duties need a socket.  A steer arriving later then answers
+    ``ERR_NO_HANDLER``, which is the truth -- without C2 there is no return
+    channel it could have arrived on.
+
+    Never raises: this runs inside install/uninstall, and neither may take a
+    session down (INV-C1).
+    """
+    try:
+        from . import client
+
+        instance = client.active_client()
+        if instance is not None:
+            instance.set_steer_handler(handler)
+    except Exception:
+        logger.debug("cp_discord: wiring the steer handler failed", exc_info=True)
 
 
 def _reason_of(decision: authz.Decision) -> Optional[str]:
@@ -367,5 +454,6 @@ __all__: Sequence[str] = (
     "is_installed",
     "reset_state",
     "set_run_depth_for_test",
+    "steer_message",
     "uninstall",
 )

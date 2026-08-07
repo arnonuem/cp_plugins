@@ -173,44 +173,54 @@ def test_an_everyone_in_a_report_chunk_cannot_ping(built):
 # --------------------------------------------------------------------------- #
 
 
-def test_the_bot_does_not_request_message_content(built):
-    """Least privilege: ``on_message`` does not exist, so neither may the intent.
+def test_the_bot_requests_message_content_for_its_handler(built):
+    """Least privilege, now satisfied from the other side: the consumer exists.
 
-    ``message_content`` is PRIVILEGED -- with it the bot receives the full text
-    of every message in the guild.  Nothing reads it (§6.0 is not built), so a
-    leaked token would have inherited a read capability the feature never used.
+    TURNED AROUND, not deleted (§4.2).  ``message_content`` is PRIVILEGED and
+    was off for as long as nothing read it; §6.0's ``on_message`` is now
+    built, and without the intent it would receive an empty
+    ``message.content`` -- the chat path would be dead with no symptom at all.
+    The pairing this test used to guard still holds; only its direction moved.
     """
     intents = built.get("intents")
 
     assert intents is not None
-    assert intents.message_content is False
+    assert intents.message_content is True
 
 
-def test_the_requested_intents_are_the_plain_defaults(built):
-    """Nothing privileged slipped in beside ``message_content``.
+def test_message_content_is_the_only_intent_that_was_added(built):
+    """Nothing privileged slipped in BESIDE ``message_content``.
 
-    Pinned as a whole-object comparison so that a future edit adding
-    ``members`` or ``presences`` -- the other two privileged intents -- has to
-    come past this test rather than past a reviewer.
+    Still a whole-object comparison, and for the unchanged reason: a future
+    edit adding ``members`` or ``presences`` -- the other two privileged
+    intents -- has to come past this test rather than past a reviewer.  Only
+    the baseline moved, from the plain defaults to the defaults plus the one
+    intent §6.0 actually consumes.
     """
     import discord
 
-    assert built["intents"] == discord.Intents.default()
+    expected = discord.Intents.default()
+    expected.message_content = True
+
+    assert built["intents"] == expected
 
 
-def test_no_on_message_handler_exists():
-    """The load-bearing half of Befund 2: the intent has no consumer.
+def test_the_on_message_handler_is_registered_here():
+    """The load-bearing half of Befund 2, and it did its job.
 
-    If somebody adds ``on_message`` they should re-enable the intent, and this
-    test is what tells them the two belong together -- it fails, pointing at
-    the comment in ``connect_gateway``.
+    It was written to FAIL the day somebody added ``on_message`` without the
+    intent, and to point at the comment in ``connect_gateway``.  That day has
+    come; both halves moved together, so the test moves with them.  It keeps
+    guarding the same pairing from the other end: the handler has to be
+    registered right here, in the function that builds the client, or the
+    privileged intent above collects text nobody reads.
     """
     import inspect
 
     source = inspect.getsource(broker_activation.connect_gateway)
 
     assert "async def on_ready" in source
-    assert "async def on_message" not in source
+    assert "async def on_message" in source
 
 
 # --------------------------------------------------------------------------- #

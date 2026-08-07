@@ -28,8 +28,10 @@ import json
 import logging
 import socket
 import threading
-from typing import Any, Callable, Dict, Optional, Sequence
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Optional, Sequence
 
+from . import constants
 from .broker_election import LOOPBACK
 from .broker_server import (
     ERR_BAD_REQUEST,
@@ -37,6 +39,11 @@ from .broker_server import (
     M_RESOLVE,
     SOCKET_TIMEOUT,
 )
+
+# Straight from its own module, not through :mod:`.broker_server` like the
+# names above: that file sits one line under the project's cap, and the two
+# lines a re-export costs there are the two it does not have (SPEC §5a).
+from .broker_steer import M_STEER
 from .wire import read_frame, serve_accept_loop, write_frame
 
 logger = logging.getLogger(__name__)
@@ -50,6 +57,21 @@ ERR_NO_HANDLER = "no_handler"
 #: with the decision because the APPROVER check happens in the SESSION, which
 #: owns the authorization database -- not in the broker.
 ResolutionHandler = Callable[..., Any]
+
+#: The handler signature C5 implements (§4.3c): called with ``external_id``
+#: and ``text``, answering a flat ``dict`` of ``accepted``/``steer``/``mode``.
+#: A ``dict`` rather than C5's own ``Delivery`` -- importing that type here
+#: would turn the dependency between the two modules around
+#: (``inbound.py:33-36``).
+SteerHandler = Callable[..., Any]
+
+#: How many delivered messages the duplicate window remembers (§4.4a).
+#:
+#: The only source of repeats is the broker's own retry -- three attempts, one
+#: second apart -- so this is roomy by an order of magnitude.  It is a WINDOW,
+#: not a store: it needs no clearing because it evicts its own oldest entry,
+#: and it holds ids, never text.
+STEER_WINDOW = 32
 
 
 def token_matches(expected: Optional[str], offered: Any) -> bool:
@@ -68,9 +90,13 @@ class InboundListener:
 
     *authorize* answers whether a frame's token is ours, *on_refused* fires
     when it is not (that refusal is the only thing that would ever make a
-    session with a rotated token look at the portfile again), and
-    *handler_provider* is consulted per frame because C4 installs its handler
+    session with a rotated token look at the portfile again), and both
+    providers are consulted per frame because C4 and C5 install their handlers
     after the socket is already up.
+
+    *steer_provider* is OPTIONAL and stays optional: a listener without one
+    simply answers ``no_handler`` to a steer, which is what a session that has
+    not brought C5 up should say.
     """
 
     def __init__(
@@ -79,10 +105,18 @@ class InboundListener:
         authorize: Callable[[Any], bool],
         on_refused: Callable[[], None],
         handler_provider: Callable[[], Optional[ResolutionHandler]],
+        steer_provider: Optional[Callable[[], Optional[SteerHandler]]] = None,
     ) -> None:
         self._authorize = authorize
         self._on_refused = on_refused
         self._handler_provider = handler_provider
+        self._steer_provider = steer_provider or (lambda: None)
+        # Per INSTANCE, not module-global: tests build their own listeners and
+        # have to stay isolated from one another.  No lock -- this listener
+        # serves on exactly one thread and works its connections through
+        # strictly in sequence, so a second concurrent ``dispatch`` does not
+        # arise in production.
+        self._seen_steers: Deque[Any] = deque(maxlen=STEER_WINDOW)
         self._lock = threading.Lock()
         self._socket: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -174,10 +208,15 @@ class InboundListener:
             self._refuse()
             return {"ok": False, "error": ERR_UNAUTHORIZED}
 
-        if payload.get("method") != M_RESOLVE:
-            return {"ok": False, "error": ERR_BAD_REQUEST}
+        # AFTER the token, never before (INV-3): the healing above depends on
+        # a bad token being refused whatever verb it claims to carry.
+        method = payload.get("method")
         params = payload.get("params")
         params = params if isinstance(params, dict) else {}
+        if method == M_STEER:
+            return self._on_steer(params)
+        if method != M_RESOLVE:
+            return {"ok": False, "error": ERR_BAD_REQUEST}
 
         handler = self._handler_provider()
         if handler is None:
@@ -202,6 +241,61 @@ class InboundListener:
             answer["refusal"] = refusal
         return answer
 
+    def _on_steer(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """One chat message on its way into this session (§4.3a).
+
+        Six answers, and only ONE of them is ``ok: False``.  A frame that was
+        TAKEN is acked even when it changed nothing -- the same rule
+        ``M_RESOLVE`` follows below.  ``ok: False`` makes the broker retry for
+        three seconds and then announce in the thread that the session is not
+        answering: for a stranger's message that would be three wasted seconds,
+        an untrue notice, and confirmation that the session is alive (INV-6).
+        Two answers earn it: a missing handler (transient -- C5 may still be
+        wiring up) and a handler that RAISED.  The second is retried too, and
+        that is deliberate: we did not evaluate the message, so we must not
+        ack it.  Acking would drop it silently; refusing costs three seconds
+        on a path that only opens when ``steer_message`` itself is broken.
+        """
+        handler = self._steer_provider()
+        if handler is None:
+            return {"ok": False, "error": ERR_NO_HANDLER}
+
+        message_id = params.get("message_id")
+        if message_id is not None and message_id in self._seen_steers:
+            # Delivered before; the answer was lost on the way back and the
+            # broker is retrying.  Acknowledged like a delivery (§4.4b) --
+            # the message DID arrive, and saying otherwise would be a lie.
+            return {"ok": True, "steer": constants.STEER_DUPLICATE}
+
+        try:
+            result = handler(
+                external_id=params.get("external_id"), text=params.get("text")
+            )
+        except Exception:
+            # No text and no sender in the record: this may be an
+            # unauthorized message, and its content must not reach a log
+            # (``inbound.py:201``).
+            logger.debug("cp_discord: steering a message failed", exc_info=True)
+            return {"ok": False, "error": ERR_BAD_REQUEST}
+
+        result = result if isinstance(result, dict) else {}
+        answer: Dict[str, Any] = {
+            "ok": True,
+            "steer": str(result.get("steer") or constants.STEER_UNDELIVERED),
+        }
+        if not result.get("accepted"):
+            # Not accepted, so nothing was steered: the id stays OUT of the
+            # window.  Entering it before the verdict would answer a
+            # stranger's retry with ``duplicate`` instead of ``refused`` --
+            # and the broker reacts to ``duplicate``.  INV-6 would fall
+            # through the deduplication.
+            return answer
+        if message_id is not None:
+            self._seen_steers.append(message_id)
+        if result.get("mode"):
+            answer["mode"] = result["mode"]
+        return answer
+
     def _refuse(self) -> None:
         try:
             self._on_refused()
@@ -211,7 +305,9 @@ class InboundListener:
 
 __all__: Sequence[str] = (
     "ERR_NO_HANDLER",
+    "STEER_WINDOW",
     "InboundListener",
     "ResolutionHandler",
+    "SteerHandler",
     "token_matches",
 )

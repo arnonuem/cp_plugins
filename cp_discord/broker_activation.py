@@ -20,6 +20,7 @@ plugin would be broken while the unit tests stayed green.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -27,7 +28,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple
 
 from . import broker_autojoin
 from . import broker_election as election
-from . import broker_threads
+from . import broker_steer, broker_threads
 from .broker_server import (
     ELECTION_ATTEMPTS,
     ELECTION_RETRY_DELAY,
@@ -213,6 +214,82 @@ def active_supervisor() -> Optional[BrokerSupervisor]:
     return _supervisor
 
 
+def _active_broker() -> Optional[Broker]:
+    """The broker this session runs, or ``None`` -- checking BOTH steps.
+
+    Two ``Optional``s, and skipping either one raises inside the Discord event
+    loop.  The state is genuinely reachable: the client's thread is a daemon
+    whose ``run()`` never returns, so after :func:`uninstall` has set
+    ``_supervisor`` to ``None`` the loop keeps delivering messages -- and the
+    next one would hit ``AttributeError`` on ``None.broker``.  An unhandled
+    error in that loop is INV-C1 broken by teardown.
+
+    The second step is the ordinary case rather than the exotic one: a session
+    that LOST the election has a supervisor and no broker.
+    """
+    supervisor = active_supervisor()
+    if supervisor is None:
+        return None
+    return supervisor.broker
+
+
+async def _on_message(message: Any, *, broker: Optional[Broker]) -> None:
+    """One Discord message on its way into the session that owns its thread.
+
+    MODULE-GLOBAL on purpose (§4.6a).  The obvious home is inside
+    :func:`connect_gateway`'s ``run()``, but that closure is marked
+    ``no cover`` and is reachable from outside only through
+    ``inspect.getsource`` -- a handler locked in there could be asserted about
+    only as a STRING, and "the source mentions ``to_thread``" is not a
+    measurement of anything.  Out here it can be awaited with a fake broker
+    and a fake message, which is what AC-B5 needs.
+
+    Four ways a message ends here, all of them SILENTLY:
+
+    * from a bot -- our own reports are posted by one, and answering them
+      would turn every report into an instruction.  ``message.author.bot``
+      filters foreign bots too, which is intended: no bot has business
+      steering an agent;
+    * without a broker -- no token and no port, so the message cannot even be
+      evaluated.  A reaction would confirm the session to a possible stranger
+      without any authorization having happened (INV-6);
+    * from a thread that belongs to no session -- guessing "the first one"
+      would steer a stranger's words into whichever session sorted first;
+    * with an answer that says ``refused``, or with no answer at all -- see
+      :func:`broker_steer.reaction_for`.
+
+    The delivery goes OFF the loop.  ``push`` is a blocking socket round trip
+    that retries for up to three seconds; on the gateway's loop that stalls
+    every other session's posts, every gate widget and the connection's own
+    heartbeat.  Same move as ``broker_gates.view_factory``.
+
+    Never raises: this IS the event loop's callback, and a failed chat
+    delivery must not become the session's problem (INV-C1).
+    """
+    try:
+        if broker is None or getattr(message.author, "bot", False):
+            return
+        session_id = broker.registry.session_for_thread(
+            getattr(message.channel, "id", None)
+        )
+        if session_id is None:
+            return
+        steer = await asyncio.to_thread(
+            broker.deliver_steer,
+            session_id,
+            external_id=message.author.id,
+            text=message.content,
+            message_id=message.id,
+        )
+        reaction = broker_steer.reaction_for(steer)
+        if reaction is not None:
+            await message.add_reaction(reaction)
+    except Exception:
+        # No text and no sender: this may be an unauthorized message, and its
+        # content must not reach a log (``inbound.py:201``).
+        logger.debug("cp_discord: an inbound chat message failed", exc_info=True)
+
+
 def active_gateway() -> Optional[broker_threads.DiscordGateway]:
     return _gateway
 
@@ -246,13 +323,14 @@ def connect_gateway(config: Any, gateway: broker_threads.DiscordGateway) -> None
 
     import discord
 
-    # NO ``message_content``.  It is a PRIVILEGED intent, and the only handler
-    # registered below is ``on_ready`` -- the bot would collect the full text
-    # of every message in the guild and never read a byte of it.  Turn it back
-    # on together with the ``on_message`` handler of §6.0 (follow-up
-    # ``followups/20260802_chat_zustellweg_discord_zu_sitzung.md``), not before:
-    # without the intent that handler receives empty ``message.content``.
+    # ``message_content`` IS privileged, and it is on because §6.0's
+    # ``on_message`` now exists: without it that handler would receive an
+    # empty ``message.content`` and the chat path would be silently dead.  It
+    # is the ONLY addition -- ``members`` and ``presences``, the other two
+    # privileged intents, stay off, and a test pins the whole object so a
+    # future edit has to come past it rather than past a reviewer.
     intents = discord.Intents.default()
+    intents.message_content = True
 
     # Suppression belongs to the CONNECTION, not to each call site.  py-cord
     # folds this into every outgoing message (``discord/abc.py:1623-1630``), so
@@ -267,6 +345,10 @@ def connect_gateway(config: Any, gateway: broker_threads.DiscordGateway) -> None
             client = discord.Client(
                 intents=intents, allowed_mentions=discord.AllowedMentions.none()
             )
+
+            @client.event
+            async def on_message(message: Any) -> None:
+                await _on_message(message, broker=_active_broker())
 
             @client.event
             async def on_ready() -> None:
@@ -363,6 +445,7 @@ def uninstall() -> None:
 
 __all__: Sequence[str] = (
     "BrokerSupervisor",
+    "_on_message",
     "activation_notices",
     "active_gateway",
     "active_supervisor",

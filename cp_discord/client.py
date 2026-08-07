@@ -61,7 +61,12 @@ from .broker_server import (
     SOCKET_TIMEOUT,
     SUPERVISION_INTERVAL,
 )
-from .client_inbound import ERR_NO_HANDLER, InboundListener, ResolutionHandler
+from .client_inbound import (
+    ERR_NO_HANDLER,
+    InboundListener,
+    ResolutionHandler,
+    SteerHandler,
+)
 from .wire import read_frame
 
 logger = logging.getLogger(__name__)
@@ -109,10 +114,12 @@ class SessionClient:
         self._registered = False
 
         self._handler: Optional[ResolutionHandler] = None
+        self._steer_handler: Optional[SteerHandler] = None
         self._inbound = InboundListener(
             authorize=self._authorized,
             on_refused=self._refresh_token_now,
             handler_provider=lambda: self._handler,
+            steer_provider=lambda: self._steer_handler,
         )
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -136,6 +143,18 @@ class SessionClient:
     def set_resolution_handler(self, handler: Optional[ResolutionHandler]) -> None:
         """Point inbound gate resolutions at C4 (or at nothing)."""
         self._handler = handler
+
+    def set_steer_handler(self, handler: Optional[SteerHandler]) -> None:
+        """Point inbound chat messages at C5 (or at nothing).
+
+        The counterpart of :meth:`set_resolution_handler`, and just as
+        load-bearing: without this call every steer is answered ``no_handler``
+        and the whole chat path is dead while the suite stays green.  C5 makes
+        the call itself, in ``install``/``uninstall`` -- the other direction
+        would have this module import ``inbound``, inverting the layering
+        that module documents (``inbound.py:33-36``).
+        """
+        self._steer_handler = handler
 
     def adopt_token_for_test(self, token: Optional[str]) -> None:
         """Force the cached token, reproducing a rotation we have not seen.

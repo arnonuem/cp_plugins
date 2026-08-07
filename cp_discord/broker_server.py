@@ -37,13 +37,15 @@ import time
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from . import broker_election as election
-from . import broker_gates, broker_threads
+from . import broker_gates, broker_steer, broker_threads
 from .broker_election import LOOPBACK, BrokerAddress
 
 #: Re-exported so that :mod:`.broker_server` stays the single import site for
 #: the wire, exactly as it already is for ``client`` and ``client_inbound``.
 #: Each value lives in the lowest layer using it -- the frame limit in
 #: :mod:`.wire`, the rest next door; binding them by NAME keeps them aligned.
+#: ``M_STEER`` is the ONE exception (SPEC §5a): the lines a re-export costs
+#: are the lines this file does not have, so it is taken from its own module.
 from .broker_gates import (  # noqa: F401
     GATE_CLOSED,
     GATE_OPEN,
@@ -172,11 +174,10 @@ class Broker:
     def kill_thread_for_test(self) -> None:
         """Stop the serving thread while leaving the broker 'installed'.
 
-        This reproduces INV-C22's second death case -- broker thread gone,
-        process alive -- which is otherwise only reachable by injecting an
-        exception into a running thread.  It is on the production class
-        because the supervisor's recovery path is production code and needs a
-        real dead thread to recover from, not a mocked ``is_alive``.
+        Reproduces INV-C22's second death case -- broker thread gone, process
+        alive -- otherwise only reachable by injecting an exception into a
+        running thread.  On the production class because the supervisor's
+        recovery is production code and needs a real dead thread, not a mock.
         """
         self.stop()
 
@@ -422,6 +423,22 @@ class Broker:
         self._safely(self._gateway.post, session_id, UNDELIVERABLE)
         return False, None
 
+    def deliver_steer(
+        self, session_id: str, *, external_id: Any, text: Any, message_id: Any
+    ) -> Optional[str]:
+        """Push a chat message into a session.  What became of it, or ``None``.
+
+        Thin on purpose: a steer lives in :mod:`.broker_steer` -- including
+        why it may not live beside :meth:`_push_resolution` (§4.3b).
+        """
+        record = self.registry.get(session_id)
+        if record is None or not record.inbound_port:
+            return broker_steer.no_inbound_port(session_id)
+        frame = broker_steer.steer_frame(
+            self.token, session_id, external_id, text, message_id
+        )
+        return broker_steer.push_steer(record.inbound_port, frame)
+
     def is_marked_dead(self, session_id: str) -> bool:
         """Whether the session's listener could not be reached at all."""
         return session_id in self._unreachable
@@ -511,12 +528,11 @@ def _mark_local_only(text: str) -> str:
 # Plugin surface (C6 drives this)
 # --------------------------------------------------------------------------- #
 #
-# The election, the supervision and the Discord login live in
-# :mod:`.broker_activation`.  These names stay HERE because
-# ``register_callbacks.COMPONENTS`` addresses this layer as ``broker_server``
-# (``register_callbacks.py:112``) and calls ``install()`` on whatever it
-# imports -- so the entry point has to carry that name.  The import is
-# deferred because ``broker_activation`` imports :class:`Broker` from here.
+# Election, supervision and the Discord login live in :mod:`.broker_activation`.
+# These names stay HERE because ``register_callbacks.COMPONENTS`` addresses the
+# layer as ``broker_server`` (``register_callbacks.py:112``) and calls
+# ``install()`` on what it imports -- so the entry point has to carry that name.
+# The import is deferred: ``broker_activation`` imports :class:`Broker` here.
 
 #: W2's seam (AC-85c): re-read the token after a rejection.  Bound by NAME so
 #: there is exactly one reader of the portfile.

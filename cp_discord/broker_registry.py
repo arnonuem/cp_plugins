@@ -151,6 +151,31 @@ class SessionRegistry:
         with self._lock:
             return list(self._records.values())
 
+    def session_for_thread(self, thread_id: Any) -> Optional[str]:
+        """Which session owns *thread_id*, or ``None`` (INV-4, §6.0).
+
+        DERIVED from the records rather than kept as a second map, and that is
+        the whole design: :meth:`set_thread_id` refuses unknown sessions on
+        purpose (see its docstring), so a separately maintained reverse map
+        would reproduce exactly that consistency problem one level up -- it
+        could hold a thread whose record is already gone, and the next chat
+        message would be steered into a session that was released. A derived
+        lookup cannot diverge by construction, and a linear scan over a
+        handful of sessions costs nothing.
+
+        An unusable id answers ``None`` rather than matching: ``thread_id`` is
+        ``None`` between a registration and Discord's answer, so a bare
+        equality test would make every threadless session a wildcard for every
+        unmapped message.
+        """
+        if not isinstance(thread_id, int) or isinstance(thread_id, bool):
+            return None
+        with self._lock:
+            for record in self._records.values():
+                if record.thread_id == thread_id:
+                    return record.session_id
+        return None
+
     # -- writing --------------------------------------------------------
 
     def upsert(self, record: SessionRecord) -> None:
