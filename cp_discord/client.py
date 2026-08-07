@@ -58,11 +58,11 @@ from .broker_server import (
     M_RELEASE,
     M_REPORT,
     M_STATE,
-    MAX_FRAME_BYTES,
     SOCKET_TIMEOUT,
     SUPERVISION_INTERVAL,
 )
 from .client_inbound import ERR_NO_HANDLER, InboundListener, ResolutionHandler
+from .wire import read_frame
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +466,7 @@ def _round_trip(host: str, port: int, payload: bytes) -> Optional[Dict[str, Any]
             sock.settimeout(SOCKET_TIMEOUT)
             sock.sendall(payload)
             with sock.makefile("rb") as stream:
-                line = stream.readline(MAX_FRAME_BYTES)
+                line = read_frame(stream)
     except OSError:
         return None
     if not line:

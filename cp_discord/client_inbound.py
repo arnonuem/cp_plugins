@@ -35,9 +35,9 @@ from .broker_server import (
     ERR_BAD_REQUEST,
     ERR_UNAUTHORIZED,
     M_RESOLVE,
-    MAX_FRAME_BYTES,
     SOCKET_TIMEOUT,
 )
+from .wire import read_frame, serve_accept_loop, write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -146,40 +146,16 @@ class InboundListener:
     # -- serving --------------------------------------------------------
 
     def _serve(self, sock: socket.socket) -> None:
-        while not self._stop.is_set():
-            try:
-                connection, _peer = sock.accept()
-            except (TimeoutError, socket.timeout):
-                continue
-            except OSError:
-                # Closed underneath us (stop) or a transient accept failure.
-                # Ending the loop on a transient one would leave the socket
-                # bound and the port registered while nothing drains it: the
-                # broker keeps delivering, reads a transport failure, and
-                # finally archives the thread of a live session (AC-15).
-                if self._stop.is_set():
-                    return
-                logger.debug("cp_discord: an inbound accept failed", exc_info=True)
-                continue
-            try:
-                self._handle_connection(connection)
-            except Exception:
-                logger.debug("cp_discord: an inbound frame failed", exc_info=True)
-            finally:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
+        serve_accept_loop(sock, self._stop, self._handle_connection, logger)
 
     def _handle_connection(self, connection: socket.socket) -> None:
         connection.settimeout(SOCKET_TIMEOUT)
         with connection.makefile("rwb") as stream:
-            line = stream.readline(MAX_FRAME_BYTES)
+            line = read_frame(stream)
             if not line:
                 return
             response = self.dispatch(line)
-            stream.write((json.dumps(response) + "\n").encode("utf-8"))
-            stream.flush()
+            write_frame(stream, response)
 
     def dispatch(self, line: bytes) -> Dict[str, Any]:
         """Answer one frame.  ALWAYS answers -- silence would mean a retry."""

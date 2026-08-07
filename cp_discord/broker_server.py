@@ -42,12 +42,11 @@ from .broker_election import LOOPBACK, BrokerAddress
 
 #: Re-exported so that :mod:`.broker_server` stays the single import site for
 #: the wire, exactly as it already is for ``client`` and ``client_inbound``.
-#: The values LIVE in :mod:`.broker_gates` because that is the lowest layer
-#: using them; binding them by NAME here is what keeps the two from drifting.
+#: Each value lives in the lowest layer using it -- the frame limit in
+#: :mod:`.wire`, the rest next door; binding them by NAME keeps them aligned.
 from .broker_gates import (  # noqa: F401
     GATE_CLOSED,
     GATE_OPEN,
-    MAX_FRAME_BYTES,
     M_RESOLVE,
     RETRY_ATTEMPTS,
     RETRY_DELAY,
@@ -55,6 +54,7 @@ from .broker_gates import (  # noqa: F401
     UNDELIVERABLE,
 )
 from .reporter import BLOCKED, LOCAL_ONLY_MARKER
+from .wire import MAX_FRAME_BYTES, read_frame, serve_accept_loop, write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -183,38 +183,19 @@ class Broker:
     # -- serving --------------------------------------------------------
 
     def _serve(self) -> None:
-        while not self._stop.is_set():
-            server = self._server
-            if server is None:
-                return
-            try:
-                connection, _peer = server.accept()
-            except (TimeoutError, socket.timeout):
-                continue
-            except OSError:
-                # Closed underneath us (stop) or a transient accept failure.
-                if self._stop.is_set():
-                    return
-                continue
-            try:
-                self._handle_connection(connection)
-            except Exception:
-                logger.debug("cp_discord: broker connection failed", exc_info=True)
-            finally:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
+        server = self._server
+        if server is None:
+            return
+        serve_accept_loop(server, self._stop, self._handle_connection, logger)
 
     def _handle_connection(self, connection: socket.socket) -> None:
         connection.settimeout(SOCKET_TIMEOUT)
         with connection.makefile("rwb") as stream:
-            line = stream.readline(MAX_FRAME_BYTES)
+            line = read_frame(stream)
             if not line:
                 return
             response = self._dispatch(line)
-            stream.write((json.dumps(response) + "\n").encode("utf-8"))
-            stream.flush()
+            write_frame(stream, response)
 
     def _dispatch(self, line: bytes) -> Dict[str, Any]:
         """Answer one frame.  ALWAYS answers: silence would trigger a retry."""

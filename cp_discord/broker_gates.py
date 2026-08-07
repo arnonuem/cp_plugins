@@ -41,6 +41,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from . import approvals_ui
 from .broker_election import LOOPBACK
+from .wire import MAX_FRAME_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,6 @@ M_RESOLVE = "resolve"
 #: §3.2: connections are short-lived, so this is a latency budget rather than
 #: a patience setting.  INV-C17 allows 100 ms for a delivery.
 SOCKET_TIMEOUT = 0.5
-
-#: A frame longer than this is not a frame (defence against a local process
-#: feeding an endless line to either end).
-MAX_FRAME_BYTES = 1024 * 1024
 
 #: A rejected delivery is retried this often, this far apart (§3.1, AC-85d).
 #: The session re-reads the portfile the moment it rejects one, so attempt two
