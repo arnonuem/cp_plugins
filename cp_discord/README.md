@@ -1,40 +1,40 @@
-# cp_discord — deine Terminal-Sitzungen auf dem Handy
+# cp_discord — your terminal sessions, on your phone
 
-Jede Code-Puppy-Sitzung bekommt einen eigenen Discord-Thread. Du siehst, was
-der Agent tut, gibst Freigaben per Knopfdruck und schreibst ihm dazwischen —
-vom Sofa oder von unterwegs.
+Every Code Puppy session gets its own Discord thread. Watch what the agent is
+doing, approve gates with a tap, and steer it mid-run by just typing — from
+the sofa or from the train.
 
-**Ein Bot, beliebig viele Sitzungen.** Eine Sitzung übernimmt automatisch die
-Discord-Verbindung (den „Broker"), die anderen hängen sich an. Fällt sie weg,
-übernimmt binnen 30 Sekunden eine andere.
+**One bot, any number of sessions.** One session automatically holds the
+Discord connection (the "broker"); the others attach to it. If it goes away,
+another takes over within 30 seconds.
 
 ---
 
-## 1. Discord-Server und Kanal
+## 1. Discord server and channel
 
-1. Discord öffnen → links unten **`+`** → **Server erstellen** → *Eigenen
-   erstellen* → *Nur für mich*. Name egal.
-2. Im Server: **`+`** neben *Textkanäle* → Kanal anlegen, z. B. `#puppy`.
+1. In Discord: **`+`** at the bottom left → **Create My Own** → *For me and my
+   friends*. The name does not matter.
+2. Inside the server: **`+`** next to *Text Channels* → create one, e.g.
+   `#puppy`.
 
-> Ein privater Server für dich allein ist der Normalfall. Der Bot legt in
-> diesem Kanal **private Threads** an — pro Sitzung einen.
+> A private server for yourself is the normal case. The bot creates **private
+> threads** in this channel — one per session.
 
-## 2. Bot anlegen
+## 2. Create the bot
 
 1. https://discord.com/developers/applications → **New Application**
-2. Links **Bot** → **Add Bot**
-3. **Reset Token** → Token kopieren. **Das ist ein Passwort.** Er wird nur
-   einmal angezeigt.
-4. Runterscrollen zu **Privileged Gateway Intents** →
-   **MESSAGE CONTENT INTENT einschalten** → *Save Changes*
+2. **Bot** in the sidebar → **Add Bot**
+3. **Reset Token** → copy it. **This is a password.** It is shown once.
+4. Scroll to **Privileged Gateway Intents** →
+   turn on **MESSAGE CONTENT INTENT** → *Save Changes*
 
-> Ohne diesen Schalter kommt jede Chat-Nachricht **leer** beim Bot an. Der
-> Rückweg (Terminal → Discord) funktioniert, das Schreiben nicht — ohne
-> Fehlermeldung.
+> Without that switch every chat message arrives **empty**. The outbound
+> direction (terminal → Discord) still works, typing back does not — and
+> nothing tells you why.
 
-## 3. Bot auf den Server einladen
+## 3. Invite the bot
 
-1. Links **OAuth2** → **URL Generator**
+1. **OAuth2** in the sidebar → **URL Generator**
 2. Scopes: **`bot`**
 3. Bot Permissions:
    - Send Messages
@@ -43,117 +43,113 @@ Discord-Verbindung (den „Broker"), die anderen hängen sich an. Fällt sie weg
    - Manage Threads
    - Read Message History
    - Add Reactions
-4. Erzeugte URL unten kopieren, im Browser öffnen, Server auswählen,
-   **Autorisieren**.
+4. Copy the generated URL at the bottom, open it, pick your server,
+   **Authorize**.
 
-## 4. IDs einsammeln
+## 4. Collect the IDs
 
-Zuerst einmalig: **Einstellungen → Erweitert → Entwicklermodus** einschalten.
+First, once: **Settings → Advanced → Developer Mode** on.
 
-| Was | Wie |
+| What | How |
 |---|---|
-| **Kanal-ID** | Rechtsklick auf `#puppy` → *Kanal-ID kopieren* |
-| **Deine User-ID** | Rechtsklick auf deinen Namen → *Benutzer-ID kopieren* |
-| **Bot-Token** | aus Schritt 2 |
+| **Channel ID** | right-click `#puppy` → *Copy Channel ID* |
+| **Your user ID** | right-click your own name → *Copy User ID* |
+| **Bot token** | from step 2 |
 
-## 5. py-cord nachinstallieren
+## 5. Install py-cord
 
-Code Puppy bringt die Discord-Bibliothek nicht mit:
+Code Puppy does not ship the Discord library:
 
 ```powershell
 uv pip install --python "$env:APPDATA\uv\tools\code-puppy\Scripts\python.exe" "py-cord>=2.8.1,<3"
 ```
 
-Fehlt sie, startet Code Puppy normal weiter und meldet nur:
-*„the Discord bridge needs py-cord"*.
+Without it Code Puppy starts normally and just says:
+*"the Discord bridge needs py-cord"*.
 
-## 6. Konfigurieren
+## 6. Configure
 
 In `~\.code_puppy\puppy.cfg`:
 
 ```ini
 cp_discord_enabled    = 1
-discord_bot_token     = DEIN_BOT_TOKEN
+discord_bot_token     = YOUR_BOT_TOKEN
 cp_discord_channel_id = 1234567890123456789
 
-discord_approvers     = discord:9876543210987654321=deinname
-discord_allow_from    = discord:9876543210987654321=deinname
+discord_approvers     = discord:9876543210987654321=yourname
+discord_allow_from    = discord:9876543210987654321=yourname
 ```
 
-**Format:** `discord:<deine-user-id>=<beliebiger-name>`. Mehrere Einträge mit
-Komma trennen.
+**Format:** `discord:<your-user-id>=<any-name>`. Separate several with commas.
 
-**Die zwei Rollen sind unabhängig** — eine folgt nicht aus der anderen:
+**The two roles are independent** — neither implies the other:
 
-| Schlüssel | Rolle | Darf |
+| Key | Role | May |
 |---|---|---|
-| `discord_approvers` | APPROVER | Freigaben erteilen (Approve/Deny) |
-| `discord_allow_from` | TALKER | dem Agenten schreiben |
+| `discord_approvers` | APPROVER | answer gates (Approve/Deny) |
+| `discord_allow_from` | TALKER | send instructions to the agent |
 
-> Fehlt `discord_allow_from`, werden deine Chat-Nachrichten **stumm
-> verworfen** — grüner Haken bleibt aus, kein Fehler. Für den vollen
-> Funktionsumfang brauchst du beide Zeilen.
+> Miss out `discord_allow_from` and your chat messages are **discarded
+> silently** — no check mark, no error. You want both lines.
 
 ### Optional
 
 ```ini
-cp_discord_mode     = report     ; oder: stream  (Default: report)
-cp_discord_autojoin = 1          ; Approver automatisch in neue Threads holen
+cp_discord_mode     = report     ; or: stream  (default: report)
+cp_discord_autojoin = 1          ; pull approvers into new threads automatically
 ```
 
-- **`report`** — eine Statuszeile während der Arbeit, am Wartepunkt ein
-  Bericht. Sparsam, gut fürs Handy.
-- **`stream`** — laufende Ausgabe mit.
+- **`report`** — one status line while it works, a report when it parks.
+  Quiet, good on a phone.
+- **`stream`** — follow the output as it happens.
 
-Alle Werte lassen sich auch per Umgebungsvariable setzen
-(`CP_DISCORD`, `DISCORD_BOT_TOKEN`, `CP_DISCORD_CHANNEL_ID`,
-`CP_DISCORD_MODE`, `CP_DISCORD_AUTOJOIN`, `DISCORD_ALLOW_FROM`,
-`DISCORD_APPROVERS`) — die Umgebung gewinnt.
+Every value can also come from the environment (`CP_DISCORD`,
+`DISCORD_BOT_TOKEN`, `CP_DISCORD_CHANNEL_ID`, `CP_DISCORD_MODE`,
+`CP_DISCORD_AUTOJOIN`, `DISCORD_ALLOW_FROM`, `DISCORD_APPROVERS`) — the
+environment wins.
 
-## 7. Plugin deployen
+## 7. Deploy the plugin
 
 ```powershell
 cd C:\Projekte_prv\arnonuem\cp_plugins
 powershell -ExecutionPolicy Bypass -File deploy.ps1 cp_discord
 ```
 
-Kopiert das Plugin nach `~\.code_puppy\plugins\cp_discord\`.
+Copies the plugin to `~\.code_puppy\plugins\cp_discord\`.
 
-## 8. Starten
+## 8. Start
 
-Code Puppy neu starten. Im Kanal erscheint ein Thread mit dem Namen deines
-Projekts.
+Restart Code Puppy. A thread named after your project appears in the channel.
 
-**Probe:** Schreib „hallo" in den Thread. Es sollte ein  erscheinen und der
-Agent antworten.
+**Check:** type "hello" into the thread. You should get a  and an answer.
 
 ---
 
-## Wenn etwas nicht geht
+## When something does not work
 
-**Nach jedem Deploy alle Sitzungen neu starten.** Plugins werden nur beim
-Start geladen, und der Broker kann in *jeder* Sitzung sitzen — läuft dort
-alter Code, ist der Weg unterbrochen, obwohl alle anderen aktuell sind.
+**Restart every session after a deploy.** Plugins load at startup only, and
+*any* session can be the one holding the Discord connection — if that one
+runs the old code the path is broken even though all the others are current.
 
-| Symptom | Ursache |
+| Symptom | Cause |
 |---|---|
-| Kein Thread erscheint | `py-cord` fehlt (Schritt 5) oder Token/Kanal-ID falsch |
-| Buttons: *„hat nicht rechtzeitig reagiert"* | Der Broker-Prozess hat alten Code → alle Sitzungen neu starten |
-| Chat: nichts passiert, kein Haken | `discord_allow_from` fehlt (Schritt 6) |
-| Chat: Haken, aber keine Reaktion | Du schreibst in einen **alten** Thread. Nach einem Neustart legt die Sitzung einen **neuen** an |
-| Nachricht im Leerlauf bleibt liegen | Braucht Code Puppy ≥ dem Leerlauf-Fix (`cdb4bf4a`) |
+| No thread appears | `py-cord` missing (step 5), or wrong token / channel ID |
+| Buttons say *"did not respond in time"* | The broker session runs old code → restart all sessions |
+| Chat: nothing happens, no check mark | `discord_allow_from` missing (step 6) |
+| Chat: check mark, but no reaction | You are typing in an **old** thread. A restarted session creates a **new** one |
+| Message sits there while nothing runs | Needs Code Puppy ≥ the idle fix (`cdb4bf4a`) |
 
-**Buttons haben 120 Sekunden.** Die Meldung nach 3 Sekunden ist etwas
-anderes: Dann hat *niemand* geantwortet — der Klick ist gar nicht angekommen.
+**Buttons are good for 120 seconds.** The message after 3 seconds means
+something else: *nobody* answered — the press never arrived.
 
-## Sicherheit
+## Security
 
-- Der Bot-Token ist ein **Passwort**. Wer ihn hat, kann als dein Bot posten.
-  Nicht committen.
-- Threads sind **privat**: Wer nicht hinzugefügt ist, sieht und schreibt
-  nichts.
-- Ein **unautorisierter** Absender bekommt keine Reaktion, keine Zustellung,
-  und sein Text landet in **keinem** Log — bewusst so.
-- **TALKER gilt global**, nicht pro Sitzung: Steht ein zweiter Name in
-  `discord_allow_from`, darf er **jede** deiner Sitzungen steuern. Für den
-  Einzelbetrieb egal, bei mehreren Personen zu bedenken.
+- The bot token is a **password**. Anyone holding it can post as your bot.
+  Do not commit it.
+- Threads are **private**: whoever was not added sees nothing and writes
+  nothing.
+- An **unauthorized** sender gets no reaction, no delivery, and their text
+  reaches **no** log. That is deliberate.
+- **TALKER is global**, not per session: a second name in
+  `discord_allow_from` may steer **every** one of your sessions. Irrelevant
+  for single-user setups, worth knowing with more people.
