@@ -172,10 +172,18 @@ def build_gate_view(gate_id: str, report: ClickReporter) -> Any:
 
     *report* answers what happened, and the answer goes to the CLICKER only
     (ephemeral): whether a click was authorized is not the channel's business.
+
+    **The view MUST be stored.**  ``store=False`` is what py-cord calls
+    "ignore item callbacks" (``discord/ui/view.py:572``), and its
+    ``ViewStore.add_view`` returns immediately on ``if not view._store``
+    (``:990``) -- the buttons are posted, look normal, and nothing is ever
+    registered to answer them.  A press then finds no callback, ``defer()``
+    never runs, and Discord gives up after its 3 s deadline with "the
+    application did not respond in time".  Measured against py-cord 2.8.1.
     """
     import discord
 
-    view = discord.ui.View(timeout=GATE_TIMEOUT_SECONDS, store=False)
+    view = discord.ui.View(timeout=GATE_TIMEOUT_SECONDS)
     for label, style, decision in (
         (APPROVE_LABEL, discord.ButtonStyle.success, DECISION_APPROVE),
         (DENY_LABEL, discord.ButtonStyle.danger, DECISION_DENY),

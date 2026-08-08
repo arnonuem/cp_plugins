@@ -588,6 +588,35 @@ def test_the_view_is_built_on_the_gateway_loop_not_the_caller_thread(
     assert posted_gate(channel).view is not None
 
 
+def test_the_gate_view_is_stored_so_a_press_reaches_its_callback():
+    """``store=False`` posts buttons that can never answer.
+
+    py-cord's own wording (``discord/ui/view.py:572``): setting it to False
+    "will ignore item callbacks". ``ViewStore.add_view`` bails out on
+    ``if not view._store`` (``:990``) BEFORE registering anything, so the
+    gate looks perfectly normal and every press dies on Discord's 3 s
+    acknowledgement deadline -- "the application did not respond in time".
+
+    Not hypothetical: it shipped that way and made every Approve/Deny
+    button in production dead. Calling ``button.callback`` directly in a
+    test still passed, which is exactly why this asserts the STORE flag
+    instead -- that is the part Discord actually goes through.
+    """
+
+    async def report(decision, discord_user_id):
+        return None
+
+    async def build():
+        return approvals_ui.build_gate_view("g-store", report)
+
+    view = asyncio.new_event_loop().run_until_complete(build())
+
+    assert view._store is True, (
+        "the gate view must be stored: an unstored view ignores its button "
+        "callbacks and every press times out"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # AC-47 — the files W4 touched stay under 600 lines
 # --------------------------------------------------------------------------- #
