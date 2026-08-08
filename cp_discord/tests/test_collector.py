@@ -153,6 +153,40 @@ def test_ac81a_the_report_lists_the_tools_since_the_last_wait_point(mailbox, sin
     assert "pytest -q" in body
 
 
+def test_the_tool_log_can_be_switched_off_without_losing_the_answer(
+    mailbox, sink, monkeypatch
+):
+    """``cp_discord_tool_log = 0`` drops the inventory, nothing else.
+
+    The ``-> tool`` / ``<- tool (n ms)`` list is the bulk of a report and
+    reads as noise to somebody who only wants to know what the agent SAID.
+    Switching it off must not cost the answer -- otherwise the report is
+    empty and never posted at all (see the test below).
+    """
+    monkeypatch.setattr(collector_module, "_tool_log_enabled", lambda: False)
+
+    state, report = _wire(mailbox)
+    state.on_run_start()
+    report.on_pre_tool_call("read_file", {"file_path": "a.py"})
+    report.on_post_tool_call("read_file", {"file_path": "a.py"}, None, 12.0)
+    report.on_stream_event(*_part_start("Here is what I found."))
+    state.on_run_end()
+    _settle(mailbox)
+
+    body = _text_of(sink.reports[-1])
+    assert "Here is what I found." in body, "the answer must survive"
+    assert "read_file" not in body
+    assert "a.py" not in body
+    assert "ms)" not in body
+
+
+def test_the_tool_log_defaults_to_on(mailbox, sink):
+    """Unconfigured means ON -- the inventory is why most people read it."""
+    from cp_discord import register_callbacks
+
+    assert register_callbacks.tool_log_enabled() is True
+
+
 def test_ac81a_an_empty_report_is_never_emitted(mailbox, sink):
     """Nothing happened -> nothing to report.  The counterpart of the above."""
     state, _report = _wire(mailbox)

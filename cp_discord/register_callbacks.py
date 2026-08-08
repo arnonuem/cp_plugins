@@ -86,6 +86,9 @@ MODE_REPORT = "report"
 MODE_STREAM = "stream"
 MODES = (MODE_REPORT, MODE_STREAM)
 
+TOOL_LOG_ENV_VAR = "CP_DISCORD_TOOL_LOG"
+TOOL_LOG_CONFIG_KEY = "cp_discord_tool_log"
+
 INSTALL_HINT = "uv sync --extra discord"
 
 #: Values that mean "on".  Anything else -- including the empty string an
@@ -262,6 +265,19 @@ def autojoin_enabled() -> bool:
     "not configured" means on, and only an explicit falsy value turns it off.
     """
     raw = _setting(AUTOJOIN_ENV_VAR, AUTOJOIN_CONFIG_KEY)
+    return True if raw is None else raw.lower() in _TRUTHY
+
+
+def tool_log_enabled() -> bool:
+    """Whether the report lists the tools that ran.  Default ON.
+
+    Same shape as :func:`autojoin_enabled`: not configured means on, only an
+    explicit falsy value turns it off.  Off leaves the assistant's answer,
+    the gates and the status line untouched -- it drops ONLY the
+    ``-> tool`` / ``<- tool (n ms)`` inventory, which is noise to some
+    readers and the whole point to others.
+    """
+    raw = _setting(TOOL_LOG_ENV_VAR, TOOL_LOG_CONFIG_KEY)
     return True if raw is None else raw.lower() in _TRUTHY
 
 

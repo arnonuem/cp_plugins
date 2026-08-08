@@ -97,16 +97,21 @@ discord_allow_from    = discord:9876543210987654321=yourname
 ```ini
 cp_discord_mode     = report     ; or: stream  (default: report)
 cp_discord_autojoin = 1          ; pull approvers into new threads automatically
+cp_discord_tool_log = 0          ; drop the tool list from reports (default: on)
 ```
 
 - **`report`** — one status line while it works, a report when it parks.
   Quiet, good on a phone.
 - **`stream`** — follow the output as it happens.
+- **`cp_discord_tool_log = 0`** — reports keep the agent's answer and the
+  gates but drop the `-> tool` / `<- tool (n ms)` inventory. That list is the
+  bulk of a long report; turn it off if you only care what the agent *said*.
+  Takes effect on the next tool, no restart needed.
 
 Every value can also come from the environment (`CP_DISCORD`,
 `DISCORD_BOT_TOKEN`, `CP_DISCORD_CHANNEL_ID`, `CP_DISCORD_MODE`,
-`CP_DISCORD_AUTOJOIN`, `DISCORD_ALLOW_FROM`, `DISCORD_APPROVERS`) — the
-environment wins.
+`CP_DISCORD_AUTOJOIN`, `CP_DISCORD_TOOL_LOG`, `DISCORD_ALLOW_FROM`,
+`DISCORD_APPROVERS`) — the environment wins.
 
 ## 7. Deploy the plugin
 

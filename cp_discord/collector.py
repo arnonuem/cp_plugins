@@ -43,6 +43,28 @@ from .reporter import (
 
 logger = logging.getLogger(__name__)
 
+
+def _tool_log_enabled() -> bool:
+    """Read the setting per call, not once at construction.
+
+    Deferred import: ``register_callbacks`` imports THIS module, so a
+    module-level import would close the cycle.  Reading it per call also
+    means ``/set cp_discord_tool_log false`` takes effect on the next tool
+    without a restart -- the reports are the one thing an operator tunes
+    while watching them.
+
+    Fails OPEN (returns True): a broken lookup must not silently strip the
+    tool inventory out of the report that a gate decision depends on.
+    """
+    try:
+        from . import register_callbacks
+
+        return register_callbacks.tool_log_enabled()
+    except Exception:
+        logger.debug("cp_discord: reading the tool-log setting failed", exc_info=True)
+        return True
+
+
 #: Ring bounds (§8b).  Whichever is reached first ends the ride.
 MAX_ENTRIES = 50
 MAX_BYTES = 8 * 1024
@@ -138,6 +160,8 @@ class ReportCollector:
         command being approved is the single most important line in it.
         """
         try:
+            if not _tool_log_enabled():
+                return None
             self._append_entry(rendering.tool_start_text(str(tool_name), tool_args))
         except Exception:
             logger.debug("cp_discord: collecting a tool call failed", exc_info=True)
@@ -152,6 +176,8 @@ class ReportCollector:
         context: Any = None,
     ) -> None:
         try:
+            if not _tool_log_enabled():
+                return None
             self._append_entry(
                 rendering.tool_end_text(str(tool_name), _as_duration(duration_ms))
             )
