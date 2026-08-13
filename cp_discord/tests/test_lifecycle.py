@@ -498,7 +498,7 @@ def test_shutdown_tears_down_c5_to_c1(config, sink, monkeypatch):
 def test_the_teardown_order_is_the_exact_reverse_of_the_startup_order():
     layers = [component.layer for component in register_callbacks.COMPONENTS]
 
-    assert layers == ["C1", "C2", "C3", "C7", "C4", "C5"]
+    assert layers == ["C1", "C2", "C3", "C7", "C4", "C5", "C8"]
 
 
 def test_startup_twice_starts_the_layers_once(config, sink, monkeypatch):

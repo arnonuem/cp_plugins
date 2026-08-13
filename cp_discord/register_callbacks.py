@@ -2,7 +2,7 @@
 
 This is the only place the plugin touches Code Puppy's lifecycle.  It reads the
 configuration (SPEC §8a), loads the identities into the authorization database,
-and brings the six layers up and down in a defined order.
+and brings the seven layers up and down in a defined order.
 
 **The activation path is INVERTED compared to the old plugin.**  That one
 contributed a ``--discord`` flag and, in ``handle_cli_args``, booted a gateway
@@ -114,11 +114,11 @@ class Component:
     module: str
 
 
-#: The six layers, in STARTUP order.  Teardown walks this list backwards, which
-#: yields C5 -> C4 -> C7/C3 -> C2 -> C1: close the inbound paths first, then the
-#: reporters, then deregister the session, and only then stop the broker.  The
-#: other way round a session would deregister from a broker that is already
-#: gone.
+#: The seven layers, in STARTUP order.  Teardown walks this list backwards,
+#: which yields C8 -> C5 -> C4 -> C7/C3 -> C2 -> C1: stop delivering first,
+#: then close the inbound paths, then the reporters, then deregister the
+#: session, and only then stop the broker.  The other way round a session
+#: would deregister from a broker that is already gone.
 COMPONENTS: Tuple[Component, ...] = (
     Component("C1", "broker_server"),
     Component("C2", "client"),
@@ -126,6 +126,7 @@ COMPONENTS: Tuple[Component, ...] = (
     Component("C7", "collector"),
     Component("C4", "approvals"),
     Component("C5", "inbound"),
+    Component("C8", "idle_delivery"),
 )
 
 # --------------------------------------------------------------------------- #
@@ -502,7 +503,7 @@ def on_startup() -> None:
 
 
 def on_shutdown() -> None:
-    """Tear the bridge down: C5 -> C4 -> C7/C3 -> C2 -> C1."""
+    """Tear the bridge down: C8 -> C5 -> C4 -> C7/C3 -> C2 -> C1."""
     _uninstall_components()
     reset_state()
 
