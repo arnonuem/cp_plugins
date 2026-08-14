@@ -142,10 +142,21 @@ runs the old code the path is broken even though all the others are current.
 | Buttons say *"did not respond in time"* | The broker session runs old code → restart all sessions |
 | Chat: nothing happens, no check mark | `discord_allow_from` missing (step 6) |
 | Chat: check mark, but no reaction | You are typing in an **old** thread. A restarted session creates a **new** one |
-| Message sits there while nothing runs | Needs Code Puppy ≥ the idle fix (`cdb4bf4a`) |
+| Message sits there while nothing runs | Handled by the plugin itself (C8); no core patch needed |
+| Buttons say "expired" while the agent still waits | Fixed — they now stay pressable for as long as the agent is waiting |
 
-**Buttons are good for 120 seconds.** The message after 3 seconds means
-something else: *nobody* answered — the press never arrived.
+**Buttons stay pressable while the agent is waiting.** They used to expire
+after 120 seconds, which made them useless in the one situation they exist
+for: being away from the machine. A gate only gets a deadline when **no**
+terminal prompt is open — nobody is at the PC to answer it then either, and
+the waiting thread needs some way to end.
+
+The "did not respond in time" message after 3 seconds means something else:
+*nobody* answered — the press never arrived.
+
+> **The buttons live in the broker session.** If the session holding the
+> Discord connection restarts, older buttons stop answering. Press one and
+> nothing happens? Answer at the PC, or start a new turn.
 
 ## Security
 

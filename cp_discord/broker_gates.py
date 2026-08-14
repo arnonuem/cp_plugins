@@ -264,7 +264,7 @@ def push(
     A refusal is retried because the session heals itself the moment it
     refuses -- it re-reads the portfile, so attempt two meets the new token.
     Without that the phone click is simply lost: the CAS lives in the session,
-    a discarded delivery never sets it, and after 120 s the Discord branch is
+    a discarded delivery never sets it, and once the Discord branch is
     dead (INV-C10).
 
     Silence is NOT retried: nobody answered, and the caller has to treat that

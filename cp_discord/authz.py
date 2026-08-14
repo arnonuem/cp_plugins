@@ -40,12 +40,20 @@ from . import bindings
 from .bindings import Role
 
 GATE_TIMEOUT_SECONDS = 120.0
-"""Not freely chosen — bounded by Discord.
+"""How long an UNATTENDED gate stays open.  L3's own bound, not Discord's.
 
-A click must be acknowledged within 3 s (``defer()``) and an interaction token
-dies after 15 minutes, which is the hard ceiling for any gate.  ACP's 600 s
-would sit uncomfortably close to that ceiling; 120 s leaves room and is ample
-for a deliberate yes/no.
+The earlier reasoning here -- that Discord's 15-minute interaction token is a
+hard ceiling for a gate -- was wrong, and it cost a day of unanswerable
+buttons.  That token belongs to the interaction a CLICK creates, not to the
+message carrying the buttons: every press opens a fresh interaction with its
+own token and its own 3 s ``defer()`` deadline.  A message with buttons has no
+expiry of its own, which is exactly what Discord's persistent-view pattern
+relies on.
+
+So this number bounds nothing external.  It is the floor under a wait that
+nobody is attending: while a terminal prompt is open the buttons carry NO
+deadline (``approvals`` INV-C10a), because the whole point of answering from a
+phone is that the human is away for longer than any number chosen here.
 """
 
 

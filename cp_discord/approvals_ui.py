@@ -54,10 +54,11 @@ DENY_LABEL = "Deny"
 DECISION_APPROVE = "approve"
 DECISION_DENY = "deny"
 
-#: Kept identical to L3's, so a gate and its widget die at the same moment.
-#: Imported rather than repeated: ``authz.py:42-49`` carries the reason the
-#: number is 120 (Discord's interaction token), and a copy here would lose it.
-GATE_TIMEOUT_SECONDS = authz.GATE_TIMEOUT_SECONDS
+#: How long the buttons stay pressable when NOBODY is at the machine.
+#: Not a security bound -- an expired gate decides nothing, it only ends the
+#: Discord branch so the waiting thread has a way out.  While a terminal
+#: prompt is open no deadline is armed at all (see ``approvals`` INV-C10a).
+UNATTENDED_TIMEOUT_SECONDS = authz.GATE_TIMEOUT_SECONDS
 
 #: Longest preview inlined into a gate.  Discord caps a body at 2000
 #: characters, so one huge diff must not push the buttons off the message.
@@ -143,10 +144,10 @@ def gate_text(
         )
         lines.append(f"```\n{body}\n```")
     if remote_resolvable:
-        lines.append(
-            f"Approve or deny below — this request expires in "
-            f"{GATE_TIMEOUT_SECONDS:.0f} s."
-        )
+        # No deadline is promised: while the agent waits at a prompt the
+        # buttons stay pressable, and naming a number that does not apply is
+        # what stopped people from using them.
+        lines.append("Approve or deny below — the agent is waiting.")
     else:
         from .reporter import LOCAL_ONLY_MARKER
 
@@ -183,7 +184,12 @@ def build_gate_view(gate_id: str, report: ClickReporter) -> Any:
     """
     import discord
 
-    view = discord.ui.View(timeout=GATE_TIMEOUT_SECONDS)
+    # ``timeout=None``: py-cord arms no timeout task (``view.py:411``), so the
+    # callbacks stay registered for as long as the process lives.  The
+    # lifetime of a gate is decided in ``approvals``, never here -- a view
+    # that timed out on its own would strand pressable-looking buttons that
+    # answer nothing.
+    view = discord.ui.View(timeout=None)
     for label, style, decision in (
         (APPROVE_LABEL, discord.ButtonStyle.success, DECISION_APPROVE),
         (DENY_LABEL, discord.ButtonStyle.danger, DECISION_DENY),
@@ -254,7 +260,7 @@ __all__: Sequence[str] = (
     "DECISION_APPROVE",
     "DECISION_DENY",
     "DENY_LABEL",
-    "GATE_TIMEOUT_SECONDS",
+    "UNATTENDED_TIMEOUT_SECONDS",
     "NOT_DELIVERED",
     "PREVIEW_LIMIT",
     "allowed_mentions",

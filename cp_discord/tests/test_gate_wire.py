@@ -617,6 +617,59 @@ def test_the_gate_view_is_stored_so_a_press_reaches_its_callback():
     )
 
 
+def test_the_gate_view_carries_no_timeout_of_its_own():
+    """The buttons must not expire while the agent is still waiting.
+
+    Sibling of the store test above, and it exists for the same reason: the
+    view shipped with ``timeout=120`` and produced buttons that looked alive
+    and answered nothing.  A user away from the machine lost a full day to
+    it -- 120 s is nothing when the whole point is answering from a phone.
+
+    py-cord arms no timeout task at all for ``timeout=None``
+    (``discord/ui/view.py:411``), so the callbacks stay registered.  How long
+    a gate lives is decided in ``approvals`` -- while a terminal prompt is
+    open, nothing expires; unattended, ``_arm_deadline_if_unattended`` sets
+    the floor.  A view that timed out on its own would overrule both.
+    """
+
+    async def report(decision, discord_user_id):
+        return None
+
+    async def build():
+        return approvals_ui.build_gate_view("g-timeout", report)
+
+    view = asyncio.new_event_loop().run_until_complete(build())
+
+    assert view.timeout is None, (
+        "the gate view must not expire on its own: its buttons have to stay "
+        "pressable for as long as the agent is waiting"
+    )
+
+
+def test_the_gate_text_promises_no_deadline():
+    """The message must not name a countdown it does not keep.
+
+    Mutation MG4 survived a full run: nothing asserted on this text, so
+    putting "expires in 120 s" back would have gone unnoticed -- and that
+    sentence is why a user left the buttons alone and lost a day.  While the
+    agent waits there is no deadline to name.
+    """
+    text = approvals_ui.gate_text(
+        title="Secrets Guard",
+        message="an agent wants to read something",
+        preview=None,
+        remote_resolvable=True,
+    )
+
+    assert "expires" not in text.lower(), (
+        f"the gate text promises an expiry that does not exist: {text!r}"
+    )
+    assert "120" not in text, f"the old countdown is back: {text!r}"
+    assert "waiting" in text.lower(), (
+        f"the text should say the agent is waiting, got: {text!r}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # AC-47 — the files W4 touched stay under 600 lines
 # --------------------------------------------------------------------------- #

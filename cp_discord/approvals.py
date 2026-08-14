@@ -27,8 +27,10 @@ CAS live in :mod:`.approvals_state`, and everything is given back on EVERY
 exit (§5.2a step 5): without that the terminal branch is dead after the FIRST
 approval of a run, and a run makes many.
 
-The timeout is not an exit: it ends the DISCORD branch only (INV-C10).  The
-terminal prompt has no timeout, exactly as without this plugin.
+**A deadline is not an exit** (INV-C10): it ends the DISCORD branch only, the
+terminal prompt never has one, and while a prompt is open the buttons have
+none either (INV-C10a, ``SwitchState.arm_deadline``) -- dying after 120 s
+regardless broke the one case they exist for: the user away for hours.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ from .approvals_state import (
     Gate,
     SwitchState,
 )
-from .approvals_ui import DECISION_APPROVE, GATE_TIMEOUT_SECONDS
+from .approvals_ui import DECISION_APPROVE, UNATTENDED_TIMEOUT_SECONDS
 from .bindings import Role
 
 logger = logging.getLogger(__name__)
@@ -201,6 +203,9 @@ def approval_backend(
         remote = _start_discord_branch(gate)
         _after_gate_posted(gate)
         local = _run_terminal_branch(gate)
+        # AFTER the terminal branch: a running prompt is what decides whether
+        # the buttons get a deadline at all (INV-C10a).
+        _state.arm_deadline(gate, UNATTENDED_TIMEOUT_SECONDS, _expire)
         if not remote and not local:
             # Neither branch ever existed: nobody could have said yes.  This
             # is the ONLY fail-closed path (INV-C7, AC-33/35).
@@ -254,19 +259,14 @@ def _start_discord_branch(gate: Gate) -> bool:
         logger.debug("cp_discord: submitting a gate failed", exc_info=True)
         delivered = False
     gate.discord_alive = bool(delivered)
-    if delivered:
-        gate.timer = threading.Timer(GATE_TIMEOUT_SECONDS, _expire, args=(gate,))
-        gate.timer.daemon = True
-        gate.timer.start()
     return gate.discord_alive
 
 
 def _expire(gate: Gate) -> None:
-    """The 120 s deadline: ends the DISCORD branch, nothing else (INV-C10).
+    """End the DISCORD branch, nothing else (INV-C10).
 
-    Not a winner, not an exit: the mark and the slot stay, because the
-    terminal prompt is still open (AC-49).  Giving them back here would let a
-    concurrent approval put a SECOND Application on the same stdin.
+    Not a winner, not an exit: the mark and the slot stay, since a concurrent
+    approval would otherwise put a SECOND Application on the same stdin.
     """
     if not _state.expire(gate):
         return
@@ -574,7 +574,7 @@ __all__: Sequence[str] = (
     "DECIDED_IN_DISCORD",
     "DECIDED_IN_TERMINAL",
     "GATE_EXPIRED",
-    "GATE_TIMEOUT_SECONDS",
+    "UNATTENDED_TIMEOUT_SECONDS",
     "MARK_EMPTY",
     "MARK_LIVE",
     "MARK_PENDING",

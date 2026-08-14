@@ -509,26 +509,64 @@ def test_ac34_the_backend_never_calls_the_core_approval(authz_db, prompts, disco
     assert calls == []
 
 
+def _only_gate():
+    """The single gate currently open, for asserting on its timer."""
+    gates = list(approvals._state._gates.values())
+    assert len(gates) == 1, f"expected exactly one open gate, got {len(gates)}"
+    return gates[0]
+
+
 # --------------------------------------------------------------------------- #
 # AC-49 / AC-63 / AC-65 — the timeout belongs to the Discord branch ALONE
 # --------------------------------------------------------------------------- #
 
 
-def test_ac49_the_discord_timeout_leaves_the_terminal_prompt_open(
+def test_ac49_an_open_prompt_means_the_buttons_never_expire(
     authz_db, prompts, discord, monkeypatch
 ):
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
+    """The buttons outlive any deadline while the agent is waiting.
+
+    This is the defect that started it: a user away from the machine came
+    back to "expired -- answerable at the PC only" and could do nothing all
+    day.  While a prompt is open no deadline is armed at all, so the wait is
+    the only thing that decides how long the buttons live.
+    """
+    monkeypatch.setattr(approvals, "UNATTENDED_TIMEOUT_SECONDS", 0.05)
 
     result, done, _ = backend_in_thread()
     prompt = wait_for_prompt()
     assert prompt.running.wait(5)
 
-    time.sleep(0.3)
+    gate = _only_gate()
+    time.sleep(0.3)  # ten times the deadline, were one armed
+
+    assert gate.timer is None, "a prompt is open -- no deadline may be armed"
+    assert gate.discord_alive, "the buttons died while the agent was waiting"
     assert not done.is_set(), "the timeout ended the terminal branch too"
 
     prompt.answer(True)
     assert done.wait(5)
     assert result["value"] == (True, None)
+
+
+def test_an_unattended_gate_still_gets_a_deadline(
+    authz_db, prompts, discord, monkeypatch
+):
+    """Without a prompt the deadline stays -- or the wait never ends.
+
+    ``_await_resolution`` leaves in two ways only: an answer, or BOTH
+    branches ending.  With no terminal branch, the Discord branch expiring is
+    the only remaining exit; dropping the timer here would hang the backend
+    forever and, since its thread is joined at shutdown, stop Code Puppy from
+    exiting.
+    """
+    monkeypatch.setattr(approvals, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(approvals, "UNATTENDED_TIMEOUT_SECONDS", 0.05)
+
+    result, done, _ = backend_in_thread()
+
+    assert done.wait(5), "nobody at the machine and no deadline -- hung"
+    assert result["value"] == (False, None)
 
 
 def test_ac63_a_dead_broker_kills_only_the_discord_branch(
@@ -549,7 +587,7 @@ def test_ac65_without_a_broker_the_terminal_branch_has_no_timeout(
     authz_db, prompts, monkeypatch
 ):
     monkeypatch.setattr(approvals, "_active_client", lambda: None)
-    monkeypatch.setattr(approvals, "GATE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(approvals, "UNATTENDED_TIMEOUT_SECONDS", 0.05)
 
     result, done, _ = backend_in_thread()
     prompt = wait_for_prompt()

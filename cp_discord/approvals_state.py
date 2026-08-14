@@ -223,6 +223,26 @@ class SwitchState:
         with self:
             return self._slot == gate.gate_id
 
+    def arm_deadline(self, gate: Gate, seconds: float, fire: Any) -> bool:
+        """Start *gate*'s deadline, unless somebody is at the machine.
+
+        Lives here because the ``timer`` field and :func:`cancel_timer` do,
+        and because the slot check has to happen UNDER the lock together with
+        the arming: checking in the caller leaves a window where the terminal
+        branch takes the slot right after the check, and the gate ends up
+        with a deadline while a prompt is open -- what INV-C10a forbids.
+
+        ``start()`` stays outside the lock: the callback takes it too.
+        """
+        with self:
+            if not gate.discord_alive or self._slot == gate.gate_id:
+                return False
+            timer = threading.Timer(seconds, fire, args=(gate,))
+            timer.daemon = True
+            gate.timer = timer
+        timer.start()
+        return True
+
     # -- observation ----------------------------------------------------
 
     @property
