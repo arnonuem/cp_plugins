@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import threading
 import time
@@ -358,7 +359,13 @@ def raw_call(broker_instance, payload):
             return json.loads(stream.readline())
 
 
-def gate_frame(broker_instance, session_id, *, seq=99, **params):
+def gate_frame(broker_instance, session_id, *, seq=99, env_id=None, **params):
+    """One hand-built ``M_GATE`` frame.
+
+    ``env_id`` is OMITTED unless given, so every existing caller keeps sending
+    the envelope it sent before R1: a ``seq`` and no id, which is the bottom
+    row of the rule table (SPEC R2.6) and today's monotonicity.
+    """
     payload = {
         "gate_id": "g1",
         "title": "Shell Command",
@@ -367,16 +374,43 @@ def gate_frame(broker_instance, session_id, *, seq=99, **params):
         "status": broker_server.GATE_OPEN,
     }
     payload.update(params)
-    return raw_call(
+    return envelope(
         broker_instance,
-        {
-            "token": broker_instance.token,
-            "method": broker_server.M_GATE,
-            "session_id": session_id,
-            "seq": seq,
-            "params": payload,
-        },
+        session_id,
+        broker_server.M_GATE,
+        payload,
+        seq=seq,
+        env_id=env_id,
     )
+
+
+def envelope(
+    broker_instance, session_id, method, params=None, *, seq=None, env_id=None
+):
+    """One hand-built frame; ``seq`` and ``env_id`` are omitted when ``None``.
+
+    Omitting rather than sending ``null`` is not a distinction the broker can
+    make (``payload.get`` cannot tell them apart) -- it is simply the closer
+    model of a sender that does not know the field, which is what R1.3's
+    "optional, but only without a ``seq``" is about.
+    """
+    frame = {
+        "token": broker_instance.token,
+        "method": method,
+        "session_id": session_id,
+        "params": {} if params is None else params,
+    }
+    if seq is not None:
+        frame["seq"] = seq
+    if env_id is not None:
+        frame["env_id"] = env_id
+    return raw_call(broker_instance, frame)
+
+
+def posted_bodies(channel):
+    """Everything that reached the session's thread, in order."""
+    assert channel.threads, "no thread was ever opened"
+    return [message.content for message in channel.threads[0].sent]
 
 
 def test_a_gate_without_a_token_is_refused(broker, gateway, session):
@@ -444,6 +478,357 @@ def test_a_re_sent_gate_under_a_new_seq_is_still_posted_once(
     gateway.wait_idle()
 
     assert len(channel.threads[0].sent) == 1
+
+
+# --------------------------------------------------------------------------- #
+# R1/R2/R3 — idempotence hangs on the envelope's IDENTITY, not on its number
+#
+# AC-1, AC-2, AC-3, AC-4, AC-4b, AC-4c, AC-4d, AC-5, AC-29.  All of them are
+# STATE tests over hand-built frames: no test has to win a race (TEST_PLAN).
+# Every frame that must survive the rule carries an ``env_id`` -- without one
+# the bottom row of the rule table applies and the criterion is unmeetable.
+# --------------------------------------------------------------------------- #
+
+
+def test_ac1_two_gates_arriving_out_of_order_are_both_posted(
+    broker, gateway, session, channel
+):
+    """AC-1: the reported failure -- a gate must not be swallowed by a number.
+
+    ``_open_gate`` reports ``gate_opened`` on the reporter's thread while
+    ``submit_gate`` sends on the caller's (ANALYSIS A3b), so the higher ``seq``
+    can perfectly well arrive first.  Under M1 (monotonicity for every method)
+    the second gate is discarded and never reaches the phone.
+    """
+    instance = registered(session, gateway)
+
+    gate_frame(
+        broker, instance.session_id, seq=7, env_id="e-late", gate_id="g2", body="later"
+    )
+    gateway.wait_idle()
+    gate_frame(
+        broker,
+        instance.session_id,
+        seq=5,
+        env_id="e-early",
+        gate_id="g1",
+        body="earlier",
+    )
+    gateway.wait_idle()
+
+    bodies = posted_bodies(channel)
+    assert len(bodies) == 2, f"a gate was swallowed: {bodies!r}"
+    assert any("later" in body for body in bodies)
+    assert any("earlier" in body for body in bodies)
+
+
+def test_ac2_an_identical_report_envelope_is_acked_but_not_applied(
+    broker, gateway, session, channel
+):
+    """AC-2 on ``M_REPORT``: the method with no second dedupe of its own.
+
+    Deliberately NOT built like ``test_a_replayed_envelope_is_answered_but_not
+    _applied`` (``test_broker.py:924``), which is an ``M_STATE`` test: there the
+    monotonicity R2 KEEPS would catch the replay, the ``env_id`` memory would
+    never be exercised, and M2 would survive.  ``_on_report`` posts its chunks
+    straight out, so a replay that got through would post twice.
+    """
+    instance = registered(session, gateway)
+    params = {"chunks": ["a report"]}
+
+    first = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        params,
+        seq=50,
+        env_id="e-report",
+    )
+    gateway.wait_idle()
+    replay = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        params,
+        seq=50,
+        env_id="e-report",
+    )
+    gateway.wait_idle()
+
+    assert first == {"ok": True}
+    assert replay["ok"] is True, "a retry must be ACKED, or it retries forever"
+    assert replay["duplicate"] is True
+    assert posted_bodies(channel) == ["a report"]
+
+
+def test_ac2_the_same_envelope_id_under_another_gate_id_is_still_a_replay(
+    broker, gateway, session, channel
+):
+    """AC-2 on ``M_GATE``, with DIFFERENT gate ids on purpose.
+
+    With the same ``gate_id`` the ``board.is_open`` dedupe
+    (``broker_threads.py:244``) would mask the mechanism and M2 would survive
+    here too.
+    """
+    instance = registered(session, gateway)
+
+    gate_frame(
+        broker, instance.session_id, seq=5, env_id="e-once", gate_id="g1", body="first"
+    )
+    gateway.wait_idle()
+    replay = gate_frame(
+        broker, instance.session_id, seq=5, env_id="e-once", gate_id="g2", body="second"
+    )
+    gateway.wait_idle()
+
+    assert replay == {"ok": True, "duplicate": True}
+    bodies = posted_bodies(channel)
+    assert len(bodies) == 1, f"the replayed envelope was applied: {bodies!r}"
+
+
+def test_ac3_a_stale_state_edge_is_still_discarded(broker, gateway, session, channel):
+    """AC-3: ``M_STATE`` KEEPS its monotonicity -- against its own mark (R2).
+
+    The two envelopes carry DIFFERENT ids on purpose: with the same one the
+    memory would catch the second and M3 ("drop the monotonicity for
+    ``M_STATE``") would survive.  A state edge is a WHOLE picture, so an older
+    one arriving late would overwrite a newer one.
+    """
+    instance = registered(session, gateway)
+
+    fresh = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_STATE,
+        {"state": "working", "message": "newer"},
+        seq=6,
+        env_id="e-6",
+    )
+    gateway.wait_idle()
+    stale = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_STATE,
+        {"state": "working", "message": "older"},
+        seq=5,
+        env_id="e-5",
+    )
+    gateway.wait_idle()
+
+    assert fresh == {"ok": True}
+    assert stale == {"ok": True, "duplicate": True}
+    assert posted_bodies(channel) == ["newer"]
+
+
+def test_ac4_a_gate_below_the_shared_high_water_mark_is_applied(
+    broker, gateway, session, channel
+):
+    """AC-4: the shared ``last_seq`` no longer discards anything (R2.2/R2.3).
+
+    The heartbeat carries no ``env_id``, so it climbs the shared counter to 9
+    the way it does today; the gate below it must still be posted.
+    """
+    instance = registered(session, gateway)
+
+    beat = envelope(broker, instance.session_id, broker_server.M_HEARTBEAT, seq=9)
+    gate = gate_frame(broker, instance.session_id, seq=5, env_id="e-gate")
+    gateway.wait_idle()
+
+    assert beat == {"ok": True}
+    assert gate == {"ok": True}
+    assert broker.registry.get(instance.session_id).last_seq == 9
+    assert len(posted_bodies(channel)) == 1, "the gate never reached the thread"
+
+
+@pytest.mark.parametrize("gate_first", [True, False])
+def test_ac4c_a_gate_and_a_state_edge_that_raced_both_arrive(
+    gate_first, broker, gateway, session, channel
+):
+    """AC-4c (and AC-4b): both arrival orders, both frames applied.
+
+    Whoever loses the draw for the lower number arrives second and used to be
+    discarded as a "replay" -- the gate under M1, the state edge under M10
+    (state edges back on the shared counter).  Built as a state test in both
+    orders rather than as a race: ``_after_gate_posted`` sits between the
+    Discord and terminal branches and cannot reproduce the reporter race at
+    all (TEST_PLAN).
+    """
+    instance = registered(session, gateway)
+
+    def send_gate(seq):
+        return gate_frame(
+            broker, instance.session_id, seq=seq, env_id="e-gate", body="an approval"
+        )
+
+    def send_edge(seq):
+        return envelope(
+            broker,
+            instance.session_id,
+            broker_server.M_STATE,
+            {"state": "blocked", "message": "waiting for approval"},
+            seq=seq,
+            env_id="e-edge",
+        )
+
+    winner, loser = (send_gate, send_edge) if gate_first else (send_edge, send_gate)
+    assert winner(7) == {"ok": True}
+    gateway.wait_idle()
+    assert loser(6) == {"ok": True}, "the second frame was answered as a duplicate"
+    gateway.wait_idle()
+
+    bodies = posted_bodies(channel)
+    assert any("an approval" in body for body in bodies), (
+        f"the gate was swallowed: {bodies!r}"
+    )
+    assert any("waiting for approval" in body for body in bodies), (
+        f"the state edge was swallowed: {bodies!r}"
+    )
+
+
+def test_ac4d_a_frame_without_an_envelope_id_keeps_todays_rule(
+    broker, gateway, session, channel
+):
+    """AC-4d / R1.3: ``env_id`` is optional -- but only WITHOUT a ``seq``.
+
+    Both halves are asserted, because dropping the second one would leave
+    ``M_REPORT`` with no protection at all: a client without ``env_id`` retries
+    three times (``SEND_ATTEMPTS``) and the report would land three times.
+    """
+    instance = registered(session, gateway)
+    numbered = {"chunks": ["numbered"]}
+
+    unnumbered = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        {"chunks": ["no numbers at all"]},
+    )
+    gateway.wait_idle()
+    first = envelope(
+        broker, instance.session_id, broker_server.M_REPORT, numbered, seq=40
+    )
+    gateway.wait_idle()
+    replay = envelope(
+        broker, instance.session_id, broker_server.M_REPORT, numbered, seq=40
+    )
+    gateway.wait_idle()
+
+    assert unnumbered == {"ok": True}, "a frame with neither field was refused"
+    assert first == {"ok": True}
+    assert replay == {"ok": True, "duplicate": True}
+    assert posted_bodies(channel) == ["no numbers at all", "numbered"]
+
+
+@pytest.mark.parametrize("unusable", ["5", True])
+def test_ac29_an_unusable_seq_is_not_a_bad_request(
+    unusable, broker, gateway, session, channel
+):
+    """AC-29: the type guards moved with the rule, behaviour unchanged (R2.6).
+
+    ``broker_server.py:241`` lets a ``"seq": "5"`` through WITHOUT comparing it
+    today.  Comparing it in the registry instead would raise, and ``_dispatch``
+    turns an exception into ``bad_request`` -- a silent behaviour change at the
+    network edge, which is what M25 puts back.
+
+    The shared counter is pushed to 40 FIRST, and that is what makes the
+    ``True`` case load-bearing: ``bool`` IS an ``int`` in Python, so an
+    unguarded ``true`` compares as 1, and only against a counter above 1 does
+    the frame get silently discarded instead of posted.  Without the climb the
+    bool half of the guard could be deleted and no test would notice.
+    """
+    instance = registered(session, gateway)
+
+    climb = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        {"chunks": ["numbered"]},
+        seq=40,
+    )
+    gateway.wait_idle()
+    answer = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        {"chunks": ["unusable seq"]},
+        seq=unusable,
+    )
+    gateway.wait_idle()
+
+    assert climb == {"ok": True}
+    assert answer == {"ok": True}
+    assert posted_bodies(channel) == ["numbered", "unusable seq"]
+
+
+def test_ac29_an_unusable_envelope_id_is_not_a_bad_request(
+    broker, gateway, session, channel
+):
+    """AC-29, other half: an ``env_id`` that is no ``str`` means "none".
+
+    Unguarded it would be looked up in the memory and a ``dict`` is not
+    hashable, so the answer would turn into ``bad_request``.  ``seq`` is
+    carried too, so the frame really does travel the bottom row of the rule
+    table -- "no id" is what makes that row apply.
+    """
+    instance = registered(session, gateway)
+
+    answer = envelope(
+        broker,
+        instance.session_id,
+        broker_server.M_REPORT,
+        {"chunks": ["unusable env id"]},
+        seq=41,
+        env_id={"not": "a string"},
+    )
+    gateway.wait_idle()
+
+    assert answer == {"ok": True}
+    assert posted_bodies(channel) == ["unusable env id"]
+
+
+def test_ac5_ten_concurrent_gates_all_reach_the_thread(
+    broker, gateway, session, channel, monkeypatch
+):
+    """AC-5: N=10 over the REAL client -- 10 distinct ids, 10 posts, 0 lost.
+
+    ``_round_trip`` is module-global, so wrapping it records every envelope
+    that actually went out without touching the client's own path (TEST_PLAN).
+    Ten threads on ONE session is the sharpest form: they share the ``seq``
+    counter and the socket, which is exactly where the gates were being lost.
+    """
+    instance = registered(session, gateway)
+    frames = []
+    guard = threading.Lock()
+    original = client._round_trip
+
+    def recording(host, port, payload):
+        with guard:
+            frames.append(json.loads(payload.decode("utf-8")))
+        return original(host, port, payload)
+
+    monkeypatch.setattr(client, "_round_trip", recording)
+
+    accepted = []
+
+    def submit(index):
+        accepted.append(
+            instance.submit_gate(f"g{index}", "Shell Command", f"ls {index}")
+        )
+
+    workers = [threading.Thread(target=submit, args=(index,)) for index in range(10)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(30)
+    gateway.wait_idle()
+
+    assert accepted == [True] * 10, f"a gate was refused: {accepted!r}"
+    gates = [frame for frame in frames if frame["method"] == broker_server.M_GATE]
+    assert len(gates) == 10
+    assert len({frame["env_id"] for frame in gates}) == 10, (
+        "two gates shared an envelope id, so one of them is a replay"
+    )
+    assert len(posted_bodies(channel)) == 10, "a gate never reached the thread"
 
 
 # --------------------------------------------------------------------------- #
@@ -671,6 +1056,106 @@ def test_the_gate_text_promises_no_deadline():
 
 
 # --------------------------------------------------------------------------- #
+# AC-17 (R6) — a gate that never reaches Discord is VISIBLE in the log
+# --------------------------------------------------------------------------- #
+
+
+def post_one_gate(manager, board, session_id="cp_discord:a", gate_id="g1"):
+    """Drive ``post_gate`` to completion on its own loop, like the pump does."""
+    asyncio.run(manager.post_gate(session_id, gate_id, "ls", None, board))
+
+
+def warnings_in(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+
+
+def test_ac17_a_gate_without_a_thread_warns(channel, caplog):
+    """AC-17 / R6.1: today this path is silent -- no log line at ANY level.
+
+    A gate the phone never sees is the exact failure this bridge exists to
+    prevent, and the operator's only evidence is the log.
+    """
+    manager = broker_threads.ThreadManager(lambda: channel)
+    board = broker_threads.GateBoard()
+
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.broker_threads"):
+        post_one_gate(manager, board)
+
+    messages = warnings_in(caplog)
+    assert len(messages) == 1, f"expected one warning, got {messages!r}"
+    assert "cp_discord:a" in messages[0] and "g1" in messages[0]
+
+
+def test_ac17_a_gate_whose_post_explodes_warns_differently(channel, caplog):
+    """AC-17 / R6.1 + R6.3: a DIFFERENT text, and it blames the POST.
+
+    The ``except`` also covers ``_revive`` (``broker_threads.py:252``), so a
+    text that named ``thread.send`` would claim more than it knows.  Two
+    incidents with the same wording would be one incident to whoever greps.
+    """
+
+    class ExplodingThread(FakeThread):
+        async def send(self, content, **kwargs):
+            raise RuntimeError("Discord said no")
+
+    manager = broker_threads.ThreadManager(lambda: channel)
+    board = broker_threads.GateBoard()
+    manager.adopt("cp_discord:a", ExplodingThread(2001, "cp_plugins/main"))
+
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.broker_threads"):
+        post_one_gate(manager, board)
+
+    messages = warnings_in(caplog)
+    assert len(messages) == 1, f"expected one warning, got {messages!r}"
+    assert "cp_discord:a" in messages[0] and "g1" in messages[0]
+    assert "send" not in messages[0].lower(), (
+        f"the text blames the send, but the except also covers _revive: {messages[0]!r}"
+    )
+
+
+def test_ac17_the_two_warnings_are_distinguishable(channel, caplog):
+    """R6.1: "unterscheidbar" is the requirement, so it gets its own test."""
+
+    class ExplodingThread(FakeThread):
+        async def send(self, content, **kwargs):
+            raise RuntimeError("Discord said no")
+
+    board = broker_threads.GateBoard()
+    threadless = broker_threads.ThreadManager(lambda: channel)
+    exploding = broker_threads.ThreadManager(lambda: channel)
+    exploding.adopt("cp_discord:a", ExplodingThread(2001, "cp_plugins/main"))
+
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.broker_threads"):
+        post_one_gate(threadless, board)
+        post_one_gate(exploding, board, gate_id="g2")
+
+    missing, failed = warnings_in(caplog)
+    assert missing != failed, "both incidents log the same sentence"
+
+
+def test_ac17_the_boards_own_dedupe_stays_silent(channel, caplog):
+    """AC-17 / R6.2: the ``board.is_open`` branch gets NO new log line.
+
+    Asserted as an ABSENCE, deliberately: that branch is the wanted dedupe --
+    ``test_a_replayed_gate_frame_is_not_posted_twice`` rests on it -- and a
+    warning on a normal path is noise that trains people to ignore the log.
+    """
+    manager = broker_threads.ThreadManager(lambda: channel)
+    board = broker_threads.GateBoard()
+    manager.adopt("cp_discord:a", FakeThread(2001, "cp_plugins/main"))
+
+    post_one_gate(manager, board)
+    with caplog.at_level(logging.DEBUG, logger="cp_discord.broker_threads"):
+        post_one_gate(manager, board)
+
+    assert warnings_in(caplog) == [], "the wanted dedupe warns"
+
+
+# --------------------------------------------------------------------------- #
 # AC-47 — the files W4 touched stay under 600 lines
 # --------------------------------------------------------------------------- #
 
@@ -687,3 +1172,54 @@ def test_ac47_every_source_file_stays_under_600_lines():
     }
 
     assert oversized == {}
+
+
+def test_a_transport_retry_carries_one_identity_and_applies_once(
+    broker, gateway, session, channel
+):
+    """AC-8 at the real client: three attempts, one envelope, one post.
+
+    This is the property the whole change rests on -- if a retry ever minted a
+    fresh id per attempt, a lost answer would post the same report three
+    times.  It had no test: the only ``_round_trip`` patch in the suite always
+    succeeds, so nothing exercised attempt 2 or 3.
+    """
+    instance = registered(session, gateway)
+    seen = []
+    answers = []
+    real = client._round_trip
+
+    def flaky(host, port, payload):
+        import json
+
+        seen.append(json.loads(payload.decode("utf-8")))
+        answer = real(host, port, payload)
+        answers.append(answer)
+        # The first two answers are lost on the way back; the broker HAS
+        # applied them, the client just never hears it and retries.
+        return None if len(seen) < 3 else answer
+
+    original = client._round_trip
+    client._round_trip = flaky
+    try:
+        from cp_discord import reporter as reporter_module
+
+        instance.sink(reporter_module.ReportEvent(["a report chunk"]))
+    finally:
+        client._round_trip = original
+
+    gateway.wait_idle()
+
+    assert len(seen) == 3, "the transport must have retried twice"
+    assert len({frame["env_id"] for frame in seen}) == 1, (
+        "every attempt must carry the SAME envelope id, or the retry stops "
+        "being idempotent"
+    )
+    assert len({frame["seq"] for frame in seen}) == 1
+    # The broker answers the whole truth even though the client only hears the
+    # last one: attempt 1 was APPLIED, attempts 2 and 3 were recognised as the
+    # same envelope.  That is AC-8 -- three deliveries, one application.
+    assert answers[0] == {"ok": True}, f"first attempt not applied: {answers[0]}"
+    assert all(a == {"ok": True, "duplicate": True} for a in answers[1:]), (
+        f"a retry was applied a second time: {answers}"
+    )

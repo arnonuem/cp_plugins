@@ -66,7 +66,9 @@ from .broker_naming import (  # noqa: F401
     session_title,
 )
 from .broker_registry import (  # noqa: F401
+    ENVELOPE_MEMORY,
     HEARTBEAT_GRACE,
+    MAX_ENVELOPE_ID,
     SessionRecord,
     SessionRegistry,
     as_optional_float,
@@ -239,9 +241,26 @@ class ThreadManager:
         split across two would put them under a fragment.  The body is capped
         by :func:`.approvals_ui.gate_text` instead, which is where the caller
         can see the limit.
+
+        **Two of the three ways out are WARNINGS** (R6.1), and they are worded
+        differently on purpose: a gate that never reaches Discord is exactly
+        the failure this bridge exists to prevent, the session is never told
+        (INV-C1), so the log is the operator's only evidence -- and two
+        incidents sharing one sentence are one incident to whoever greps.  The
+        ``board.is_open`` way out stays SILENT: it is the wanted dedupe that
+        keeps a retried gate from being posted twice, and a warning on a normal
+        path teaches people to ignore the log.
         """
         thread = self._threads.get(session_id)
-        if thread is None or board.is_open(session_id, gate_id):
+        if thread is None:
+            logger.warning(
+                "cp_discord: session %s has no Discord thread, so the gate %s "
+                "was not posted -- it can only be answered in the terminal",
+                session_id,
+                gate_id,
+            )
+            return
+        if board.is_open(session_id, gate_id):
             return
         view = (
             None
@@ -256,7 +275,16 @@ class ThreadManager:
                 allowed_mentions=approvals_ui.allowed_mentions(),
             )
         except Exception:
-            logger.debug("cp_discord: posting a gate failed", exc_info=True)
+            # "The post failed", not "the send failed" (R6.3): the block covers
+            # ``_revive`` as well, so naming ``thread.send`` would claim more
+            # than this frame knows.
+            logger.warning(
+                "cp_discord: posting the gate %s of session %s to Discord "
+                "failed -- it can only be answered in the terminal",
+                gate_id,
+                session_id,
+                exc_info=True,
+            )
             return
         board.remember(session_id, gate_id, PostedGate(message=message, view=view))
 
@@ -361,7 +389,9 @@ def __getattr__(name: str) -> Any:
 __all__: Sequence[str] = (
     "ARCHIVE_REASON",
     "AUTO_ARCHIVE_MAX",
+    "ENVELOPE_MEMORY",
     "HEARTBEAT_GRACE",
+    "MAX_ENVELOPE_ID",
     "REVIVE_REASON",
     "DiscordGateway",
     "GateBoard",

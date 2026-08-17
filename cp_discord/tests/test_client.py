@@ -275,7 +275,15 @@ def test_ten_sessions_twenty_messages_arrive_in_order(broker, gateway, clients):
 
 
 def test_seq_is_monotonic_per_session(broker, clients):
-    """§3.2: the receiver discards ``seq <= last_seq``, so it must climb."""
+    """§3.2: ``last_seq`` is still written for every applied frame (R2.2).
+
+    The docstring used to say "the receiver discards ``seq <= last_seq``, so it
+    must climb".  Only half of that survives R2: discarding by number is now
+    ``M_STATE``'s business alone (against its own mark), and for everyone else
+    the field is a diagnostic counter.  It is still WRITTEN, though, and this
+    is what proves it -- if it stops being written, R2.2 is violated and the
+    ``a_record`` fixtures that set it become meaningless.
+    """
     instance = clients()
     instance.register_now()
 
@@ -362,7 +370,11 @@ def test_the_wire_is_plain_json_never_pickle(clients, bridge_dir):
     assert raw.endswith(b"\n")
     frame = json.loads(raw.decode("utf-8"))
     assert frame["method"] == broker_server.M_REGISTER
-    assert set(frame) == {"token", "method", "session_id", "seq", "params"}
+    # ``env_id`` joined the ENVELOPE, not ``params`` (SPEC R1, 4.1): ``seq``,
+    # ``token`` and ``method`` live on this level and the id belongs with
+    # ``seq``.  Smuggling it into ``params`` would have kept this line as it
+    # was and broken the layering; this change is pre-justified (AC-18).
+    assert set(frame) == {"token", "method", "session_id", "seq", "env_id", "params"}
     assert set(frame["params"]) == {"title", "pid", "started_at", "inbound_port"}
 
 

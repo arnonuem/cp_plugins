@@ -41,6 +41,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from . import broker_election as election
@@ -72,8 +73,11 @@ from .wire import read_frame
 logger = logging.getLogger(__name__)
 
 #: §3.2: three attempts, 50 ms apart, with the IDENTICAL envelope.  Keeping
-#: the envelope is what makes the retry idempotent -- the receiver discards
-#: ``seq <= last_seq``, which only helps if the sender does not renumber.
+#: the envelope is what makes the retry idempotent -- the receiver discards an
+#: ``env_id`` it has already applied, which only helps if the sender does not
+#: mint a new one per attempt.  The number alone cannot carry that any more:
+#: two senders share one counter (a gate and its state edge race), so "lower
+#: seq" means "overtaken", not "already seen".
 SEND_ATTEMPTS = 3
 SEND_BACKOFF = 0.05
 
@@ -336,8 +340,11 @@ class SessionClient:
         """One frame; transport retries, then at most one healed retry.
 
         The transport retry (three attempts, 50 ms apart) sends the IDENTICAL
-        envelope: renumbering it would defeat the receiver's ``seq`` check and
-        let an already-applied state edge apply twice (AC-8).
+        envelope, ``env_id`` included: minting a new id per attempt would
+        defeat the receiver's replay check and let one frame be applied twice
+        (AC-8).  The id is what carries that now -- the number is shared by
+        every sender in the session, so it cannot tell a replay from a frame
+        that simply lost the race for the lower number.
 
         A healed retry is a NEW envelope, because it carries a new token or a
         new registration, and it is allowed exactly once per cause -- looping
@@ -354,6 +361,11 @@ class SessionClient:
             "method": method,
             "session_id": self.session_id,
             "seq": self._next_seq(),
+            # R1: the envelope's IDENTITY, minted here because ``_send`` is the
+            # only way to an envelope, so one line covers every method.  A
+            # HEALED retry goes through ``_send`` again and gets a new one,
+            # which is right: it was refused before anything was applied.
+            "env_id": uuid.uuid4().hex,
             "params": params,
         }
         payload = (json.dumps(envelope) + "\n").encode("utf-8")

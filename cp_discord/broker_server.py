@@ -214,11 +214,8 @@ class Broker:
         method = payload.get("method")
         if not isinstance(session_id, str) or not isinstance(method, str):
             return {"ok": False, "error": ERR_BAD_REQUEST}
-        params = payload.get("params")
-        params = params if isinstance(params, dict) else {}
-
         try:
-            return self._handle(method, session_id, payload.get("seq"), params)
+            return self._handle(method, session_id, payload)
         except Exception:
             logger.debug("cp_discord: handling %s failed", method, exc_info=True)
             return {"ok": False, "error": ERR_BAD_REQUEST}
@@ -230,19 +227,21 @@ class Broker:
         return isinstance(token, str) and hmac.compare_digest(token, self.token)
 
     def _handle(
-        self, method: str, session_id: str, seq: Any, params: Dict[str, Any]
+        self, method: str, session_id: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
+        params = payload.get("params")
+        params = params if isinstance(params, dict) else {}
         if method == M_REGISTER:
             return self._on_register(session_id, params)
 
         if self.registry.get(session_id) is None:
             return {"ok": False, "error": ERR_UNKNOWN_SESSION}
 
-        if isinstance(seq, int) and not isinstance(seq, bool):
-            if not self.registry.accept_seq(session_id, seq):
-                # ACKED on purpose: a retry must stop retrying (AC-8).  The
-                # flag lets a caller tell "applied" from "already had it".
-                return {"ok": True, "duplicate": True}
+        seq = payload.get("seq")
+        env_id = payload.get("env_id")
+        latest_wins = method == M_STATE
+        if not self.registry.accept_envelope(session_id, seq, env_id, latest_wins):
+            return {"ok": True, "duplicate": True}
 
         self.registry.touch(session_id)
         self._unreachable.discard(session_id)

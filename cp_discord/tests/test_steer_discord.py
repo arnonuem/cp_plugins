@@ -488,7 +488,14 @@ def test_the_thread_lookup_is_derived_and_not_a_second_map(bridge_dir):
     would trip over the perfectly legitimate word ``broker_threads``: a
     reverse map has to live somewhere, and every somewhere is an attribute.
     ``set_thread_id`` writing one more field than it does today is exactly
-    the divergence this invariant forbids.
+    the divergence this invariant forbids -- and that half, ``== before``, is
+    untouched.
+
+    The literal inventory grew by the two VOLATILE memories R1/R3 needed
+    (``_envelopes``, ``_state_seq``).  Neither is a thread lookup and neither
+    is written by ``set_thread_id``, so the invariant is unchanged; the list is
+    what has to be kept honest, because an unlisted field is how a second map
+    would sneak in.  Individually justified under AC-18.
     """
     registry = broker_threads.SessionRegistry()
     registry.upsert(_record("cp-s1"))
@@ -496,7 +503,11 @@ def test_the_thread_lookup_is_derived_and_not_a_second_map(bridge_dir):
 
     registry.set_thread_id("cp-s1", 3001)
 
-    assert set(registry.__dict__) == before == {"_lock", "_records", "_claimed"}
+    assert (
+        set(registry.__dict__)
+        == before
+        == {"_lock", "_records", "_claimed", "_envelopes", "_state_seq"}
+    )
     assert registry.session_for_thread(3001) == "cp-s1"
 
 

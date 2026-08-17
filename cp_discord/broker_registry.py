@@ -40,6 +40,14 @@ logger = logging.getLogger(__name__)
 #: stale entry in a list, an early one deletes a live session from view.
 HEARTBEAT_GRACE = 90.0
 
+#: R3: how many envelope ids ONE session's replay memory holds before the
+#: oldest is dropped.  Bounded because this is a replay WINDOW, not a ledger:
+#: the transport retry lives about 150 ms (``SEND_ATTEMPTS`` x
+#: ``SOCKET_TIMEOUT``), it does not survive a re-election, and a healed retry
+#: carries a new id anyway.  The residual risk -- a replay after 256 further
+#: envelopes -- is unreachable in that window.
+ENVELOPE_MEMORY = 256
+
 
 @dataclass(frozen=True, slots=True)
 class SessionRecord:
@@ -123,6 +131,30 @@ def as_optional_float(value: Any) -> Optional[float]:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+#: Longest identity we will remember.  A uuid4 hex is 32 characters; the cap is
+#: generous enough for any sane sender and small enough that the memory cannot
+#: be driven anywhere interesting.  Without it the only bound is the frame size
+#: (1 MiB, ``wire.py``), and this registry holds up to ENVELOPE_MEMORY of them
+#: PER SESSION -- measured at 230 MB for one session before the cap existed.
+#: ``len`` counts CODEPOINTS, not bytes -- 64 astral characters are ~256
+#: bytes of UTF-8.  The worst case stays around 86 KB per session, so the
+#: bound holds; it is just not a byte budget.
+#: An over-long identity is treated exactly like a missing one, which is the
+#: same tolerance the rest of the rule already applies to a malformed ``seq``.
+MAX_ENVELOPE_ID = 64
+
+
+def _usable_identity(env_id: Any) -> bool:
+    """Whether *env_id* may be remembered as an envelope identity.
+
+    Empty is NOT usable, and that matters more than it looks: a shared empty
+    identity would make every second frame of a session a "replay" and get it
+    silently discarded with ``duplicate: True`` -- the exact failure this whole
+    change exists to remove.
+    """
+    return isinstance(env_id, str) and 0 < len(env_id) <= MAX_ENVELOPE_ID
+
+
 class SessionRegistry:
     """Sessions on disk, so a re-election does not lose them (§3.3a, AC-54).
 
@@ -139,6 +171,20 @@ class SessionRegistry:
         # back, and a fresh broker must stay free to ask again for a record
         # that never got one (see :meth:`claim_thread`).
         self._claimed: Set[str] = set()
+        # R1/R3: the envelope ids already applied, per session, oldest first.
+        # NOT persisted and not part of a record, for the same reason as
+        # ``_claimed`` -- but the argument here is the PAYLOAD, not the write
+        # frequency: 256 uuids per session would go through an atomic disk
+        # write on every heartbeat, and nobody reads them.  A dict is the
+        # ordered set: insertion order is what makes the eviction FIFO.
+        self._envelopes: Dict[str, Dict[str, None]] = {}
+        # R2.1: the high-water mark for ``latest_wins`` frames, kept apart from
+        # the shared ``last_seq`` so that one gate cannot raise the bar for
+        # every state edge behind it.  Volatile too, so that ``as_json`` and
+        # the loading of older registry files stay untouched -- the price is a
+        # single unprotected state edge right after a re-election, which the
+        # new broker has not posted yet anyway.
+        self._state_seq: Dict[str, int] = {}
         self._load()
 
     # -- reading --------------------------------------------------------
@@ -189,6 +235,12 @@ class SessionRegistry:
             # archived, so a session that comes back needs a NEW one, and a
             # claim left behind would keep it silent for the rest of its life.
             self._claimed.discard(session_id)
+            # Both volatile memories go with the record, like the claim above:
+            # otherwise a released session leaves up to ``ENVELOPE_MEMORY`` ids
+            # behind for good, and its state mark would outlive the record
+            # whose removal already resets ``last_seq`` to 0.
+            self._envelopes.pop(session_id, None)
+            self._state_seq.pop(session_id, None)
             if self._records.pop(session_id, None) is None:
                 return
             self._save_locked()
@@ -252,23 +304,83 @@ class SessionRegistry:
             self._records[session_id] = replace(record, last_seen=stamp)
             self._save_locked()
 
-    def accept_seq(self, session_id: str, seq: int) -> bool:
-        """Whether *seq* is new for this session (AC-8).
+    def accept_envelope(
+        self, session_id: str, seq: Any, env_id: Any, latest_wins: bool
+    ) -> bool:
+        """Whether this envelope is NEW and may be applied (R1, R2, R3).
 
-        ``seq <= last_seq`` is discarded, which is exactly what makes a retry
-        of an identical envelope idempotent -- the transport retries three
-        times, so without this a state edge could be applied twice.
+        The ONE place the rule lives.  It sits in this module and not in
+        :mod:`.broker_server` because the dependency may not run the other way:
+        nothing in here imports the Discord side, so a
+        ``from .broker_server import M_STATE`` would be an import cycle.  The
+        caller therefore answers the only question that needs the method
+        vocabulary it already owns -- *latest_wins*: "this method carries a
+        WHOLE picture, and an older one must not overwrite a newer one", which
+        is true of ``M_STATE`` and of nothing else.
 
-        An unknown session is refused: registering is what creates the
-        sequence space, and accepting from outside it would let anyone who
-        guessed a session id inject events.
+        A ``False`` is ACKED by the caller on purpose: a retry must stop
+        retrying (AC-8), and the ``duplicate`` flag it sends back is what lets
+        a caller tell "applied" from "you already had it".
+
+        The rule, in full:
+
+        * an ``env_id`` that was already applied is a REPLAY and is discarded.
+          This is what keeps the transport's three IDENTICAL attempts
+          idempotent now that the number alone no longer does it.  A HEALED
+          retry builds a fresh envelope with a fresh id, and that is correct:
+          both of its causes (``unauthorized``, ``unknown_session``) are
+          refused before anything is applied, so it was never applied once.
+        * a *latest_wins* frame is judged by its OWN high-water mark, with or
+          without an id.  Judging it by the shared ``last_seq`` would let a
+          single gate discard every state edge still in flight behind it.
+        * any OTHER frame keeps today's monotonicity against the shared
+          ``last_seq`` -- but only while it carries NO id.  Without that
+          narrowing a sender that knows nothing of ``env_id`` would lose every
+          protection, and ``M_REPORT``, which has no second dedupe and posts
+          its chunks straight out, would post three times for one lost ack.
+        * a ``seq`` that is not a genuine ``int`` counts as NO ``seq``, and an
+          ``env_id`` that is not a non-empty ``str`` counts as NO ``env_id``.
+          The wire guard let such a frame through UNCOMPARED; comparing it here
+          would raise instead, and an exception at the network edge turns an
+          ``ok`` into a ``bad_request``.
+        * an unknown session is refused, unchanged: registering is what creates
+          the sequence space, and accepting from outside it would let anyone
+          who guessed a session id inject events.  The cell "has an id, other
+          method -> accept" does NOT override this.
+
+        ``last_seq`` keeps being written for every applied frame, as a MAXIMUM
+        and not as an assignment: an id-bearing frame is accepted without any
+        comparison, and a plain assignment would let the counter run backwards.
+        It is a diagnostic counter now, not a gate.
         """
+        number = as_optional_int(seq)
+        identity = env_id if _usable_identity(env_id) else None
         with self._lock:
             record = self._records.get(session_id)
-            if record is None or seq <= record.last_seq:
+            if record is None:
                 return False
-            self._records[session_id] = replace(record, last_seq=seq)
-            self._save_locked()
+            seen = self._envelopes.get(session_id)
+            if identity is not None and seen is not None and identity in seen:
+                return False
+            if latest_wins:
+                mark = self._state_seq.get(session_id, 0)
+            else:
+                mark = record.last_seq
+            compared = latest_wins or identity is None
+            if compared and number is not None and number <= mark:
+                return False
+            if identity is not None:
+                seen = self._envelopes.setdefault(session_id, {})
+                seen[identity] = None
+                while len(seen) > ENVELOPE_MEMORY:
+                    del seen[next(iter(seen))]
+            if number is None:
+                return True
+            if latest_wins:
+                self._state_seq[session_id] = number
+            if number > record.last_seq:
+                self._records[session_id] = replace(record, last_seq=number)
+                self._save_locked()
             return True
 
     # -- liveness (§7, INV-C13) -----------------------------------------
@@ -322,6 +434,7 @@ class SessionRegistry:
 
 
 __all__: Sequence[str] = (
+    "ENVELOPE_MEMORY",
     "HEARTBEAT_GRACE",
     "SessionRecord",
     "SessionRegistry",

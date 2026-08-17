@@ -707,19 +707,26 @@ def test_removing_a_session_persists(bridge_dir):
     assert threads.SessionRegistry().get("cp_discord:a") is None
 
 
-# -- AC-8: replays are discarded --------------------------------------------
+# -- AC-8 / AC-6 / AC-28: which envelopes the registry applies --------------
 
 
 def test_a_replayed_sequence_number_is_discarded(bridge_dir):
-    """AC-8: ``seq <= last_seq`` is dropped, so a retry is idempotent."""
+    """AC-8: for a frame with a ``seq`` and NO ``env_id``, nothing changed.
+
+    Rewritten from ``accept_seq(session_id, seq)`` to
+    ``accept_envelope(session_id, seq, env_id, latest_wins)`` (SPEC 4.1): the
+    monotonicity it asserts is now the bottom row of the rule table (R2.6),
+    reached by exactly such a frame.  Individually justified under AC-18 --
+    the operation it used to call no longer exists.
+    """
     registry = threads.SessionRegistry()
     registry.upsert(a_record())
 
-    assert registry.accept_seq("cp_discord:a", 1) is True
-    assert registry.accept_seq("cp_discord:a", 2) is True
-    assert registry.accept_seq("cp_discord:a", 2) is False
-    assert registry.accept_seq("cp_discord:a", 1) is False
-    assert registry.accept_seq("cp_discord:a", 3) is True
+    assert registry.accept_envelope("cp_discord:a", 1, None, False) is True
+    assert registry.accept_envelope("cp_discord:a", 2, None, False) is True
+    assert registry.accept_envelope("cp_discord:a", 2, None, False) is False
+    assert registry.accept_envelope("cp_discord:a", 1, None, False) is False
+    assert registry.accept_envelope("cp_discord:a", 3, None, False) is True
 
 
 def test_sequence_numbers_are_tracked_per_session(bridge_dir):
@@ -727,13 +734,99 @@ def test_sequence_numbers_are_tracked_per_session(bridge_dir):
     registry.upsert(a_record("cp_discord:a"))
     registry.upsert(a_record("cp_discord:b"))
 
-    assert registry.accept_seq("cp_discord:a", 5) is True
-    assert registry.accept_seq("cp_discord:b", 1) is True
+    assert registry.accept_envelope("cp_discord:a", 5, None, False) is True
+    assert registry.accept_envelope("cp_discord:b", 1, None, False) is True
 
 
-def test_a_sequence_number_from_an_unknown_session_is_refused(bridge_dir):
-    """Fail-closed: an unregistered session has no place in the registry."""
-    assert threads.SessionRegistry().accept_seq("cp_discord:ghost", 1) is False
+def test_ac28_an_envelope_from_an_unknown_session_is_refused(bridge_dir):
+    """AC-28: fail-closed, even for the cell that says "accept" (SPEC R2.6).
+
+    Called on the REGISTRY, not through a frame, and that is the whole point:
+    ``broker_server.py:238`` answers ``unknown_session`` before the rule is
+    ever reached, so at the frame this is not observable and M24 would
+    survive.  The ``env_id`` is present on purpose -- the naive reading of
+    "with ``env_id`` / other methods -> accept" would answer ``True`` here,
+    and accepting from outside the sequence space is what lets anyone who
+    guessed a session id inject events (see :meth:`accept_envelope`).
+
+    Replaces ``test_a_sequence_number_from_an_unknown_session_is_refused``;
+    individually justified under AC-18.
+    """
+    registry = threads.SessionRegistry()
+
+    assert registry.accept_envelope("cp_discord:ghost", 1, "e1", False) is False
+    assert registry.accept_envelope("cp_discord:ghost", None, "e2", True) is False
+
+
+def test_ac6_the_envelope_memory_is_bounded_and_never_persisted(bridge_dir):
+    """AC-6 / R3: at most ``ENVELOPE_MEMORY`` ids, FIFO, and none on disk.
+
+    Asserted through BEHAVIOUR rather than by reading the instance's fields:
+    the bound is only worth anything if the oldest id is really forgotten
+    while the newest is still refused, and that pins the eviction order too.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+    limit = threads.ENVELOPE_MEMORY
+    total = limit + 44
+
+    for index in range(total):
+        assert (
+            registry.accept_envelope("cp_discord:a", None, f"e{index}", False) is True
+        )
+
+    # Order matters: asking about a FORGOTTEN id remembers it again and evicts
+    # the oldest survivor, so the survivors are checked first.
+    newest, oldest_kept = f"e{total - 1}", f"e{total - limit}"
+    assert registry.accept_envelope("cp_discord:a", None, newest, False) is False
+    assert registry.accept_envelope("cp_discord:a", None, oldest_kept, False) is False
+    assert registry.accept_envelope("cp_discord:a", None, "e0", False) is True
+
+    assert set(registry.get("cp_discord:a").as_json()) == {
+        "session_id",
+        "title",
+        "pid",
+        "started_at",
+        "inbound_port",
+        "thread_id",
+        "last_seen",
+        "last_seq",
+    }
+
+
+def test_ac29_an_unusable_seq_or_envelope_id_counts_as_absent(bridge_dir):
+    """AC-29 at the source: the type guards moved WITH the rule (SPEC R2.6).
+
+    ``broker_server.py:241`` let a ``"seq": "5"`` through without comparing it;
+    comparing it here would raise, and ``_dispatch`` turns an exception into
+    ``bad_request`` -- a behaviour change at the network edge.  A ``seq`` that
+    is not a genuine ``int`` therefore means "no ``seq``", and an ``env_id``
+    that is not a ``str`` means "no ``env_id``".
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+
+    assert registry.accept_envelope("cp_discord:a", 5, None, False) is True
+    assert registry.accept_envelope("cp_discord:a", "5", None, False) is True
+    assert registry.accept_envelope("cp_discord:a", True, None, False) is True
+    assert registry.accept_envelope("cp_discord:a", 5, {"no": "str"}, False) is False
+    assert registry.get("cp_discord:a").last_seq == 5, "an unusable seq was written"
+
+
+def test_a_state_edge_keeps_its_own_high_water_mark(bridge_dir):
+    """R2.1: ``latest_wins`` frames must not be judged by the shared counter.
+
+    A gate at ``seq`` 6 would otherwise discard the state edge at ``seq`` 5
+    that was already in flight -- ANALYSIS A4, and the reason ``last_seq``
+    keeps being written while losing its power to discard (R2.2).
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+
+    assert registry.accept_envelope("cp_discord:a", 6, "e-gate", False) is True
+    assert registry.accept_envelope("cp_discord:a", 5, "e-edge", True) is True
+    assert registry.accept_envelope("cp_discord:a", 4, "e-stale", True) is False
+    assert registry.get("cp_discord:a").last_seq == 6, "last_seq ran backwards"
 
 
 # -- AC-14 / AC-15 / AC-51: who gets archived -------------------------------
@@ -2144,3 +2237,75 @@ def test_c6_addresses_this_layer_as_broker_server():
     assert register_callbacks.COMPONENTS[0].module == "broker_server"
     assert callable(broker_server.install)
     assert callable(broker_server.uninstall)
+
+
+def test_an_over_long_envelope_id_is_treated_as_absent(bridge_dir):
+    """A huge identity must not be remembered.
+
+    The registry holds ENVELOPE_MEMORY identities PER SESSION and the only
+    other bound is the frame size (1 MiB) -- the security review measured
+    230 MB of retention for a single session before the cap.  An over-long id
+    falls back to today's rule instead, exactly like a malformed ``seq``.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+    huge = "x" * (threads.MAX_ENVELOPE_ID + 1)
+
+    assert registry.accept_envelope("cp_discord:a", 5, huge, False) is True
+    # Remembered? Then the second one would be refused. It must not be.
+    assert registry.accept_envelope("cp_discord:a", 6, huge, False) is True
+    # It fell back to the seq rule, so a stale seq is still refused.
+    assert registry.accept_envelope("cp_discord:a", 6, huge, False) is False
+
+
+def test_an_empty_envelope_id_is_treated_as_absent(bridge_dir):
+    """The empty string must never become a shared identity.
+
+    If it did, the first empty-id frame would be remembered and every later
+    one would be discarded as a replay -- silently, with ``duplicate: True``.
+    That is the failure mode this change removes, not one it may introduce.
+    """
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+
+    assert registry.accept_envelope("cp_discord:a", 5, "", False) is True
+    assert registry.accept_envelope("cp_discord:a", 6, "", False) is True
+
+
+def test_the_same_identity_in_two_sessions_does_not_collide(bridge_dir):
+    """The memory is per session, and nothing may leak across the boundary."""
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record("cp_discord:a"))
+    registry.upsert(a_record("cp_discord:b"))
+
+    assert registry.accept_envelope("cp_discord:a", 1, "shared", False) is True
+    assert registry.accept_envelope("cp_discord:b", 1, "shared", False) is True
+
+
+def test_a_real_uuid_identity_is_remembered(bridge_dir):
+    """The cap must never be smaller than what the client actually sends.
+
+    Every other test here uses a short hand-written id, so lowering
+    MAX_ENVELOPE_ID to 8 passed the whole suite: identity dedupe would have
+    been silently off for the real client, and the seq fallback would have
+    masked it in every test -- including the retry test, which would still
+    see `duplicate: True` via the shared seq. This test uses a real
+    `uuid4().hex` and pins the boundary in absolute terms, not relative to
+    the constant.
+    """
+    import uuid
+
+    registry = threads.SessionRegistry()
+    registry.upsert(a_record())
+    real_id = uuid.uuid4().hex
+    assert len(real_id) == 32
+
+    # Same identity, DIFFERENT seq -- only the identity can catch this.
+    assert registry.accept_envelope("cp_discord:a", 1, real_id, False) is True
+    assert registry.accept_envelope("cp_discord:a", 2, real_id, False) is False
+
+    # And the boundary itself, absolute: 64 in, 65 out.
+    assert registry.accept_envelope("cp_discord:a", 3, "x" * 64, False) is True
+    assert registry.accept_envelope("cp_discord:a", 4, "x" * 64, False) is False
+    assert registry.accept_envelope("cp_discord:a", 5, "y" * 65, False) is True
+    assert registry.accept_envelope("cp_discord:a", 6, "y" * 65, False) is True
